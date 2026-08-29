@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ, if present
 
-from .clarify import pick_attribute_to_ask, pool_is_too_broad
+from .clarify import pick_attribute_to_ask
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
 from .router import classify_track, extract_slots
@@ -44,14 +44,14 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         try:
-            return self._respond(state, user_message, turn)
+            return self._respond(state, user_message, turn, top_k)
         except Exception:
             # A crash counts as a miss for this session regardless (see
             # AGENTS.md) — fail safe with a valid empty response instead of
             # raising, so one bad turn doesn't corrupt the whole run.
             return dict(EMPTY_RESPONSE)
 
-    def _respond(self, state: SessionState, user_message: str, turn: int) -> dict:
+    def _respond(self, state: SessionState, user_message: str, turn: int, top_k: int) -> dict:
         state.advance_turn(turn)
         # One call folds boundary/override/slot-extraction into state, and
         # refreshes state.durable_notes — see router.py's module docstring
@@ -64,13 +64,18 @@ class Agent:
         # hookup, now built once in state.py rather than duplicated here.
         candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
 
-        ask_attribute = None
-        if pool_is_too_broad(len(candidates), track, turn):
-            ask_attribute = pick_attribute_to_ask(candidates, state)
+        # pick_attribute_to_ask now owns the "should I even ask" gate
+        # internally (Rule C, formerly the standalone pool_is_too_broad
+        # call here) as well as which attribute to ask about (Rule D) and
+        # the boundary-just-fired skip (Rule A, auto-detected from state).
+        ask_attribute = pick_attribute_to_ask(candidates, state, top_k)
         state.record_ask(ask_attribute)
         state.log_turn(turn, track, len(candidates), ask_attribute)
 
-        ranked_ids = rank(candidates, state)
+        # index=self.index opts into rating/popularity/slot-fit scoring
+        # (see the note at the bottom of rank.py) instead of raw retrieval
+        # score order alone.
+        ranked_ids = rank(candidates, state, index=self.index)
         message = (
             f"Do you have a {ask_attribute} preference?"
             if ask_attribute
