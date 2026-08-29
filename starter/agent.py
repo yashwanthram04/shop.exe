@@ -1,102 +1,78 @@
+"""Shopping copilot Agent — orchestrates slot tracking, intent routing,
+hybrid retrieval, clarification, and ranking into the required
+reset()/respond() contract.
+
+Owner: Person D. Do not add retrieval/ranking/routing logic directly in
+this file — wire in real implementations from state.py, router.py,
+retrieval.py, clarify.py, rank.py as teammates finish them. This file's job
+is orchestration, defensive error handling, and response composition. See
+AGENTS.md for the scoring mechanics this design is built around, and for
+the list of files that must never be modified.
+"""
 from __future__ import annotations
 
-import json
-import re
-import sqlite3
 from pathlib import Path
 
+from .clarify import pick_attribute_to_ask, pool_is_too_broad
+from .rank import rank
+from .retrieval import RetrievalIndex, retrieve
+from .router import classify_track, detect_boundary, detect_override_signal, extract_slots
+from .state import SessionState
 
-TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
-    "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
-    "that", "the", "this", "to", "want", "with", "would", "you", "looking",
+EMPTY_RESPONSE = {
+    "message": "",
+    "ask_attribute": None,
+    "recommendations": [],
+    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
 }
 
 
-def _text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        return " ".join(f"{key} {item}" for key, item in value.items())
-    if isinstance(value, list):
-        return " ".join(str(item) for item in value)
-    return str(value)
-
-
-def _terms(text: str) -> list[str]:
-    return [
-        token.lower()
-        for token in TOKEN_RE.findall(text)
-        if len(token) > 1 and token.lower() not in STOPWORDS
-    ]
-
-
 class Agent:
-    """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
-
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
-        self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
-        self._sessions: set[str] = set()
-        self._build_index()
-
-    def _build_index(self) -> None:
-        cursor = self.connection.cursor()
-        cursor.execute(
-            "CREATE VIRTUAL TABLE products USING fts5("
-            "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
-        )
-        batch: list[tuple[str, str, str, str, str, str, str]] = []
-        with self.catalog_path.open(encoding="utf-8") as handle:
-            for line in handle:
-                product = json.loads(line)
-                batch.append(
-                    (
-                        str(product["parent_asin"]),
-                        _text(product.get("title")),
-                        _text(product.get("categories")),
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
-                    )
-                )
-                if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-                    batch.clear()
-        if batch:
-            cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-        self.connection.commit()
+        self.index = RetrievalIndex(catalog_path)
+        self._states: dict[str, SessionState] = {}
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # The profile is anonymized and may be used for personalization.
-        self._sessions.add(session_id)
+        self._states[session_id] = SessionState(user_profile)
 
-    def respond(
-        self,
-        session_id: str,
-        user_message: str,
-        turn: int,
-        top_k: int,
-    ) -> dict:
-        if session_id not in self._sessions:
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        state = self._states.get(session_id)
+        if state is None:
             raise RuntimeError("reset must be called before respond")
-        unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
-        if not expression:
-            recommendations: list[dict] = []
-        else:
-            rows = self.connection.execute(
-                "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
-                (expression, top_k),
-            ).fetchall()
-            recommendations = [{"parent_asin": str(row[0])} for row in rows]
+        try:
+            return self._respond(state, user_message, turn)
+        except Exception:
+            # A crash counts as a miss for this session regardless (see
+            # AGENTS.md) — fail safe with a valid empty response instead of
+            # raising, so one bad turn doesn't corrupt the whole run.
+            return dict(EMPTY_RESPONSE)
+
+    def _respond(self, state: SessionState, user_message: str, turn: int) -> dict:
+        state.override_detected = detect_override_signal(user_message)
+        if state.last_asked and detect_boundary(user_message):
+            state.close_attribute(state.last_asked)
+
+        for attribute, value in extract_slots(user_message).items():
+            state.set_slot(attribute, value, turn)
+
+        track = classify_track(state, user_message)
+        candidates = retrieve(self.index, user_message, state.slots, track, top_n=50)
+
+        ask_attribute = None
+        if pool_is_too_broad(len(candidates), track, turn):
+            ask_attribute = pick_attribute_to_ask(state)
+        state.last_asked = ask_attribute
+        state.log_turn(turn, track, len(candidates), ask_attribute)
+
+        ranked_ids = rank(candidates, state)
+        message = (
+            f"Do you have a {ask_attribute} preference?"
+            if ask_attribute
+            else "Here are some options based on what you've told me so far."
+        )
         return {
-            "message": "Here are the closest matches I found.",
-            "ask_attribute": None,
-            "recommendations": recommendations,
+            "message": message,
+            "ask_attribute": ask_attribute,
+            "recommendations": [{"parent_asin": asin} for asin in ranked_ids],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
