@@ -24,9 +24,34 @@ Cross-team contract, per Person D's stable-signature request:
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 
-from .state import SessionState
+from .state import ATTRIBUTES, SessionState
+
+# LLM message understanding (Groq). This is deliberately NOT used for the
+# reranking stage (rank.py) — an A/B test there showed reshuffling the
+# formula's own top 20 barely moved the score (+0.003, noise) for real
+# added cost/latency. Free-text slot extraction is the genuine gap: a
+# message like "lightweight dangle design for everyday wear" has no
+# exploitable keyword pattern for regex, but an LLM understands it
+# immediately (confirmed: extracts style="lightweight dangle",
+# use_case="everyday wear" correctly where _classify_unprompted below
+# would extract nothing at all).
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_TIMEOUT_SECONDS = 6  # a single turn shouldn't hang waiting on this call
+LLM_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract shopping preference slots from a customer's message. "
+    f"Valid keys: {', '.join(ATTRIBUTES)}. Only include a key if the "
+    "message genuinely expresses a preference for it — ignore filler "
+    "dialogue with no real preference (e.g. \"still exploring\", \"ask me "
+    "about one specific attribute\") and return {} for those. For "
+    "'budget', extract ONLY the bare numeric dollar amount as a string "
+    "(e.g. \"25\", never \"under 25 dollars\"). Reply with ONLY a JSON "
+    "object, no other text."
+)
 
 MATERIAL_WORDS = (
     "cotton", "polyester", "nylon", "leather", "wool",
@@ -83,6 +108,63 @@ def _first_match(text: str, words: tuple[str, ...]) -> str | None:
             best_index = index
             best_word = word
     return best_word
+
+
+def _classify_unprompted_llm(message: str, usage: dict | None) -> dict[str, str] | None:
+    """Real free-text understanding via Groq. Returns None on ANY failure —
+    no GROQ_API_KEY set, network error, timeout, malformed/non-dict JSON —
+    so the caller falls back to _classify_unprompted's regex/keyword
+    matching. Must never raise: a crash here would count as a miss for the
+    whole session (see AGENTS.md), so a bad/slow API call should degrade
+    quietly to the existing deterministic path, never break a turn.
+
+    `usage` (state.turn_usage, if given) is updated in place with real
+    prompt/completion token counts — this is a genuine model call, not a
+    $0 heuristic, and the contract's `usage` field should reflect that.
+    """
+    if not os.environ.get("GROQ_API_KEY"):
+        return None
+    try:
+        from openai import OpenAI  # lazy: avoid requiring/loading this when no Groq key is set
+
+        client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL, timeout=GROQ_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0,
+            reasoning_effort="low",  # cuts latency/tokens sharply for this small extraction task
+            messages=[
+                {"role": "system", "content": LLM_EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+        )
+
+        if usage is not None and response.usage:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + response.usage.prompt_tokens
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) + response.usage.completion_tokens
+
+        content = (response.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            content = content.split("\n", 1)[-1] if "\n" in content else content
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            return None
+        return {
+            str(key): str(value).strip()
+            for key, value in parsed.items()
+            if key in ATTRIBUTES and value not in (None, "")
+        }
+    except Exception:
+        return None
+
+
+def _understand_unprompted(message: str, usage: dict | None) -> dict[str, str]:
+    """Entry point for freeform text: real LLM understanding when a Groq
+    key is available, the regex/keyword fallback otherwise. Same shape
+    either way — nothing downstream needs to know which path ran.
+    """
+    llm_result = _classify_unprompted_llm(message, usage)
+    return llm_result if llm_result is not None else _classify_unprompted(message)
 
 
 def _classify_unprompted(message: str) -> dict[str, str]:
@@ -174,23 +256,37 @@ def classify_single(text: str) -> tuple[str, str] | None:
     return None
 
 
-def extract_slot_values(message: str, last_asked: str | None = None) -> dict[str, str]:
+def extract_slot_values(message: str, last_asked: str | None = None, usage: dict | None = None) -> dict[str, str]:
     """Pull structured {attribute: value} pairs out of free text. Pure,
     stateless classifier — see `extract_slots` below for the stateful entry
     point `agent.py` actually calls.
 
     If `last_asked` is given and the message matches the evaluator's answer
     template ("For that, what matters is: X; Y."), the value(s) are trusted
-    directly with no classification — the simulator already filtered them to
-    match `last_asked` before sending them (see AGENTS.md). Handles multiple
-    facts in one message by joining them back with "; " into the single slot
-    value (e.g. "cotton; leather") rather than changing the return shape —
-    retrieval.py/rank.py already treat slot values as opaque strings, so
-    this needs no downstream coordination; split on "; " later if needed.
+    directly with no classification (free, no LLM call) — the simulator
+    already filtered them to match `last_asked` before sending them (see
+    AGENTS.md). Handles multiple facts in one message by joining them back
+    with "; " into the single slot value (e.g. "cotton; leather") rather
+    than changing the return shape — retrieval.py/rank.py already treat
+    slot values as opaque strings, so this needs no downstream coordination;
+    split on "; " later if needed.
 
-    Falls back to keyword/regex classification (`_classify_unprompted`) for
-    anything else: turn 1's opening disclosure, an override message, or an
-    unrecognized shape (e.g. a differently-phrased private-set simulator).
+    EXCEPTION: `last_asked == "other"` is not a real attribute, so its
+    answer can't be blindly attributed to one slot — the evaluator matches
+    "other" against ANY undisclosed fact regardless of type (see
+    AGENTS.md's ISSUES.md-linked note on `ask_attribute: "other"`), so a
+    reply can legitimately mix a material AND a budget in one answer. Each
+    disclosed value is classified individually (`classify_single`, the same
+    priority order the evaluator itself uses) into its real attribute
+    instead — otherwise every fact revealed this way would land in a
+    `filled_slots["other"]` key nothing downstream ever reads, silently
+    discarding real information.
+
+    Falls back to real understanding (`_understand_unprompted`, LLM-first)
+    for anything else: turn 1's opening disclosure, an override message, or
+    an unrecognized shape (e.g. a differently-phrased private-set
+    simulator) — this is the only branch that ever costs a model call,
+    since the template match above is free and already 100% certain.
     """
     if last_asked:
         stripped = message.strip()
@@ -198,11 +294,22 @@ def extract_slot_values(message: str, last_asked: str | None = None) -> dict[str
         if answer_match:
             values = [v.strip() for v in answer_match.group(1).split(";") if v.strip()]
             if values:
+                if last_asked == "other":
+                    result: dict[str, str] = {}
+                    for value in values:
+                        classified = classify_single(value)
+                        if classified is None:
+                            continue
+                        attribute, classified_value = classified
+                        result[attribute] = (
+                            f"{result[attribute]}; {classified_value}" if attribute in result else classified_value
+                        )
+                    return result
                 return {last_asked: "; ".join(values)}
         if NO_MORE_TEMPLATE_RE.match(stripped):
             return {}
 
-    return _classify_unprompted(message)
+    return _understand_unprompted(message, usage)
 
 
 def detect_boundary(message: str) -> bool:
@@ -235,6 +342,17 @@ def apply_override(state: SessionState, message: str, turn: int) -> bool:
     disclosure (the Buying hard-constraint or the Intent-Override old
     preference), so at override time there is at most one `"freeform"`
     -sourced non-category slot to clear — see `SessionState.clear_freeform_override`.
+
+    MERGES into the target attribute rather than blindly overwriting it
+    (ISSUES.md #7): `classify_single`'s fallback bucketing means unrelated
+    facts often land under the same generic key (e.g. two different
+    disclosed facts neither matching a specific material/color/etc. word
+    list both become "feature"). If that key already holds a value, a
+    plain overwrite would silently destroy a fact that was never actually
+    contradicted — only the OLD stated preference is supposed to be
+    replaced (handled by `clear_freeform_override` above, which targets
+    the specific stale slot), not whatever else happens to share this new
+    value's attribute bucket.
     """
     value_match = OVERRIDE_VALUE_RE.search(message)
     target_text = value_match.group(1) if value_match else message
@@ -243,6 +361,18 @@ def apply_override(state: SessionState, message: str, turn: int) -> bool:
         return False
     attribute, value = classified
     state.clear_freeform_override(except_attribute=attribute)
+    existing = state.filled_slots.get(attribute)
+    if existing:
+        existing_parts = existing.split("; ")
+        if value not in existing_parts:
+            value = f"{existing}; {value}"
+        else:
+            # Already present as part of a bigger compound value — keep the
+            # fuller existing string. Overwriting with just `value` here
+            # would be the exact same destructive downgrade this fix is
+            # for, just via a different path (dropping the sibling fact
+            # instead of never merging it in).
+            value = existing
     state.set_slot(attribute, value, turn, source="freeform")
     return True
 
@@ -272,8 +402,14 @@ def extract_slots(state: SessionState, message: str) -> SessionState:
 
     state.override_detected = detect_override_signal(message)
     if not (state.override_detected and apply_override(state, message, state.turn)):
-        for attribute, value in extract_slot_values(message, last_asked=state.last_asked).items():
-            source = "asked" if attribute == state.last_asked else "freeform"
+        extracted = extract_slot_values(message, last_asked=state.last_asked, usage=state.turn_usage)
+        for attribute, value in extracted.items():
+            # A direct answer to our own question deserves "asked"
+            # confidence even when `last_asked == "other"` — the value
+            # still came from a direct reply to a question we asked, it
+            # just wasn't attributable to one named slot until classified
+            # (see extract_slot_values' "other" handling above).
+            source = "asked" if attribute == state.last_asked or state.last_asked == "other" else "freeform"
             state.set_slot(attribute, value, state.turn, source=source)
 
     state.update_durable_notes(message)

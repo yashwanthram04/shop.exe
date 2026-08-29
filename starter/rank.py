@@ -103,7 +103,7 @@ def _slot_fit_bonus(product: dict, decayed_slots: dict[str, tuple[str, float]]) 
     return bonus
 
 
-def rank(candidates: list[dict], state: SessionState, index=None) -> list[str]:
+def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | None = None) -> list[str]:
     """Order candidates best-to-worst and return up to 10 unique parent_asin.
 
     Each candidate from retrieval.py's retrieve() is
@@ -119,6 +119,13 @@ def rank(candidates: list[dict], state: SessionState, index=None) -> list[str]:
     product record from index.products (NOT candidate["attrs"], which only
     covers material/color/style/brand/category today — _slot_fit_bonus
     searches full product text instead, so it isn't limited by that gap).
+
+    `usage` is accepted for contract stability (agent.py passes a shared
+    dict here) but currently unused — no LLM call happens in this file.
+    Groq is used for message understanding in router.py instead, not
+    ranking: an A/B test showed LLM reranking of the formula's own top 20
+    barely moved the score (+0.003, noise-level) at real added cost/latency,
+    while genuine free-text understanding was the actual gap worth an LLM.
     """
     if not candidates:
         return []
@@ -153,13 +160,16 @@ def rank(candidates: list[dict], state: SessionState, index=None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# NOTE FOR PERSON D — one-line change to unlock rating/popularity/slot-fit,
-# against the CURRENT real agent.py's _respond():
+# NOTE FOR PERSON D — already wired into the real agent.py's _respond() as:
 #
-#   ranked_ids = rank(candidates, state, index=self.index)
+#   usage = {"prompt_tokens": 0, "completion_tokens": 0}
+#   ranked_ids = rank(candidates, state, index=self.index, usage=usage)
+#   ... use `usage` as the response's "usage" field ...
 #
-# Omitting index still works exactly as before (raw score order) — this is
-# a pure opt-in upgrade, same pattern as clarify.py's change.
+# `index` unlocks rating/popularity/slot-fit. `usage` stays {0, 0} here —
+# router.py's LLM-based extraction is what writes real token counts into
+# it now, not this file; kept as a parameter so agent.py's call site and
+# the final response's "usage" field don't need to change either way.
 # ---------------------------------------------------------------------------
 
 

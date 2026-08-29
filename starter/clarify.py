@@ -173,6 +173,15 @@ def pick_attribute_to_ask(
     if not pool_is_too_broad(candidate_pool, turn, top_k):
         return None
 
+    # Rule D0 — "other" bootstrap. Per AGENTS.md, asking "other" matches
+    # ANY undisclosed hidden fact regardless of type (up to 2 per ask,
+    # ~4 facts total), unlike a named attribute which only matches facts
+    # of that one type — the highest-yield probe available, previously
+    # never used (see ISSUES.md #2). Spend it early, twice, before
+    # pool-based entropy has much retrieved-candidate data to reason over.
+    if turn <= 2 and state.other_asked_count < 2:
+        return "other"
+
     # Rule D — score every unfilled, still-unasked-preferred candidate.
     # Categories already asked (but not yet filled/null) are still eligible
     # to re-ask only as a last resort — prefer fresh categories first.
@@ -189,8 +198,14 @@ def pick_attribute_to_ask(
         scored.append((cat, entropy))
 
     if not scored:
-        # Nothing clears the bar — don't waste a turn asking about an
-        # attribute unlikely to narrow anything down.
+        # Nothing clears the bar for a targeted ask. Previously this
+        # returned None here, which the evaluator answers with a fully
+        # information-free "ask me about one specific attribute" reply
+        # (ISSUES.md #2) — "other" can still surface real facts even when
+        # the pool doesn't clearly favor one attribute, so prefer it over
+        # asking nothing while it's still available.
+        if state.other_asked_count < 2:
+            return "other"
         return None
 
     best_category, _ = max(scored, key=lambda pair: pair[1])

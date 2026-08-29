@@ -44,12 +44,19 @@ class SessionState:
         self.durable_notes: str = ""  # free text for Person A's semantic query, see update_durable_notes
         self.mode: str = "browsing"
         self.debug_log: list[dict] = []  # one entry per turn, for local debugging only
+        self.turn_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        self.other_asked_count: int = 0  # see record_ask()
 
     def advance_turn(self, turn: int) -> None:
         """Call once at the start of each `respond()` call, before anything
         else touches this state, so every method below can rely on
-        `self.turn` being current."""
+        `self.turn` being current. Also resets `turn_usage` — the contract's
+        `usage` field reports THIS turn's token cost, not a running total
+        (the evaluator sums it across turns itself), so whatever LLM call
+        happens during extraction should record into a freshly-zeroed
+        counter each turn."""
         self.turn = turn
+        self.turn_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
     def set_slot(self, attribute: str, value: str, turn: int, source: str = "freeform") -> None:
         """Accumulate a new slot, or overwrite an existing one (override).
@@ -97,10 +104,19 @@ class SessionState:
         """Call once per turn with whatever `ask_attribute` this turn's
         response actually used, so `last_asked` (single, drives next turn's
         attribution) and `asked_categories` (cumulative, drives Person C's
-        "don't re-ask this" logic) both stay correct."""
+        "don't re-ask this" logic) both stay correct.
+
+        `other_asked_count` tracks "other" specifically, separately from
+        `asked_categories` — "other" reveals up to 2 undisclosed facts of
+        ANY type per ask (see AGENTS.md), so unlike a named attribute it's
+        worth asking a second time, and a plain set can't distinguish
+        "asked once" from "asked twice".
+        """
         self.last_asked = attribute
         if attribute:
             self.asked_categories.add(attribute)
+            if attribute == "other":
+                self.other_asked_count += 1
 
     def decayed_slots(self, current_turn: int) -> dict[str, tuple[str, float]]:
         """Slot values with a confidence weight that shrinks the older they

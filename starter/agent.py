@@ -73,9 +73,16 @@ class Agent:
         state.log_turn(turn, track, len(candidates), ask_attribute)
 
         # index=self.index opts into rating/popularity/slot-fit scoring
-        # (see the note at the bottom of rank.py) instead of raw retrieval
-        # score order alone.
-        ranked_ids = rank(candidates, state, index=self.index)
+        # (see the note at the bottom of rank.py). rank.py's own `usage`
+        # stays {0, 0} — it makes no LLM call — but router.py's extraction
+        # (state.turn_usage) does whenever GROQ_API_KEY is set, so both are
+        # merged into the one number this turn actually costs.
+        rank_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        ranked_ids = rank(candidates, state, index=self.index, usage=rank_usage)
+        usage = {
+            "prompt_tokens": state.turn_usage["prompt_tokens"] + rank_usage["prompt_tokens"],
+            "completion_tokens": state.turn_usage["completion_tokens"] + rank_usage["completion_tokens"],
+        }
         message = (
             f"Do you have a {ask_attribute} preference?"
             if ask_attribute
@@ -85,5 +92,5 @@ class Agent:
             "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": [{"parent_asin": asin} for asin in ranked_ids],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": usage,
         }

@@ -150,32 +150,61 @@ the metrics, even if the code runs fine.
 - **Exceptions/timeouts count as a miss for that session.** Wrap retrieval/
   ranking logic defensively; a crash costs the same as a wrong answer.
 
-## Architecture plan (what we're actually building)
+## Architecture plan (what's actually built, and what was tried and rejected)
 
 Four pieces, per turn, in this order:
-1. **Slot extraction + intent routing** — parse the customer's message into
-   structured slots (category/material/color/size/style/brand/budget/
-   feature/use_case), classify Buying vs Browsing, detect intent-override
-   (slot erasure/rewrite) and boundary/no-preference signals.
-2. **Retrieval** — Buying: hard-constraint filter + keyword/vector search.
-   Browsing: dense embedding similarity (this is the biggest gap vs. the
-   BM25-only starter, which scores ~2.5% hit rate on Browsing vs ~24% on
-   Buying — see `docs/baseline_results.json`).
-3. **Over-generality check** — if the candidate pool is still too large after
-   retrieval, skip ranking and instead pick the most useful missing slot to
-   ask about via `ask_attribute` (info-gain style: whichever slot would
-   split the remaining candidates the most).
-4. **Ranking** — combine retrieval signals (keyword score, embedding
-   similarity, filter fit, rating) into a final top-10 order. A small
-   trained model (e.g. logistic regression / LightGBM on these few features,
-   trained on the 200 public sessions) or an LLM/cross-encoder rerank step
-   both fit here — no full LLM fine-tuning, that's out of scope.
+1. **Slot extraction + intent routing** (`router.py`) — parse the customer's
+   message into structured slots (category/material/color/size/style/brand/
+   budget/feature/use_case), classify Buying vs Browsing, detect
+   intent-override (slot erasure/rewrite) and boundary/no-preference
+   signals. Genuine free-text understanding now runs here via Groq
+   (`_classify_unprompted_llm`), LLM-first with the original regex/keyword
+   matching (`_classify_unprompted`) as the fallback on any failure (no
+   key, network error, timeout, malformed response) — this is deliberately
+   the ONLY place an LLM is used for understanding, not for every turn:
+   it only fires on genuinely freeform text (turn-1 disclosures, etc.),
+   never on direct answers to our own `ask_attribute` question, since
+   those already match the evaluator's fixed reply templates with 100%
+   certainty for free (see the scoring-mechanics section above).
+2. **Retrieval** (`retrieval.py`) — Buying: hard-constraint filter +
+   keyword/vector search. Browsing: dense embedding similarity (local
+   `sentence-transformers`, always-on; optional OpenAI upgrade with
+   automatic fallback) — this was the biggest gap vs. the BM25-only
+   starter, which scored ~2.5% hit rate on Browsing vs ~24% on Buying (see
+   `docs/baseline_results.json`).
+3. **Over-generality check** (`clarify.py`) — entropy/coverage-based
+   selection of which open attribute would most split the current
+   candidate pool, with turn-budget pressure (stop asking, just recommend,
+   as turns run low).
+4. **Ranking** (`rank.py`) — a weighted formula: retrieval score + product
+   rating + review-volume popularity + a decayed-slot text-match bonus.
+   **LLM reranking of this formula's own output was tried and rejected**:
+   an A/B run (Groq, `openai/gpt-oss-20b`, reranking the top 20) moved
+   TechnicalScore by +0.003 — noise-level — while adding real latency and
+   ~207K tokens of cost across a 200-session run. The formula alone already
+   captures most of the useful signal; don't re-add LLM reranking here
+   without a real reason to expect it'll help this time.
 
-Session state (a per-session slot dict + running summary) persists across
-turns within a session and must support: incremental accumulation, override
-(erase+rewrite on contradiction), and decay (older unconfirmed slots count
-for less than recently confirmed ones). Sessions are isolated single-user
-interactions — no cross-session persistence needed or expected.
+Session state (`state.py`, `SessionState`) persists across turns within a
+session: `filled_slots` (accumulation + override/erase-and-rewrite),
+`filled_null` (boundary), decay (older unconfirmed slots count for less
+than recently confirmed ones via `decayed_slots()`), and `turn_usage`
+(reset every turn, real LLM token counts get written into it in place —
+this is what makes the contract's `usage` field non-zero when Groq
+extraction actually runs). Sessions are isolated single-user interactions —
+no cross-session persistence needed or expected.
+
+## Model/API keys (optional, both have automatic fallbacks)
+
+- `OPENAI_API_KEY` — upgrades `retrieval.py`'s embedding search from the
+  local model to `text-embedding-3-small`. Falls back to local on any
+  failure, per-call (not just at startup).
+- `GROQ_API_KEY` — enables real LLM understanding of freeform customer
+  messages in `router.py` (NOT used in `rank.py` — see above). Falls back
+  to regex/keyword extraction on any failure.
+- Both load from a local `.env` file (via `python-dotenv`, see
+  `.env.example`) — `.env` is gitignored, never commit real keys. The
+  agent runs fully offline with neither set.
 
 ## Local dev commands
 

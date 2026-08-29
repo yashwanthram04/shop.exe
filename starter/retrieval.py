@@ -50,6 +50,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_TIMEOUT_SECONDS = 8  # keep a single turn from hanging if the API is slow/unreachable
 BUDGET_TOLERANCE = 1.15  # ~15% slack: intent text is often "budget around $X", not an exact cap
+RRF_K = 60  # standard Reciprocal Rank Fusion constant (see retrieve(), ISSUES.md #1)
 
 
 def _parse_budget(value: str | None) -> float | None:
@@ -202,7 +203,13 @@ class RetrievalIndex:
                 # word from the phrase show up in this product's own
                 # categories/title text?
                 haystack = (_text(product.get("categories")) + " " + _text(product.get("title"))).lower()
-                words = [w for part in _split_slot_values(category) for w in part.split() if len(w) > 2]
+                # .lower() is load-bearing: `haystack` is lowercased, so an
+                # un-lowered word never matches. Regex extraction happened to
+                # emit lowercase, but LLM extraction emits Title Case
+                # ("Jewelry Necklaces"), which silently zeroed this filter —
+                # the empty-result fallback below then disguised it as a
+                # harmless no-op rather than an error.
+                words = [w.lower() for part in _split_slot_values(category) for w in part.split() if len(w) > 2]
                 if words and not any(word in haystack for word in words):
                     continue
             kept.append(asin)
@@ -388,20 +395,29 @@ def retrieve(
     (material/color/style/brand/category) for clarify.py's entropy-based
     attribute selection and rank.py's slot-fit scoring.
 
-    TODO (Person A): the 0.7/0.3 keyword/semantic weighting below is an
-    untuned first guess — validate/tune it against the 200 dev sessions'
-    scenario_metrics (Buying vs Browsing hit rate) once end-to-end runs are
-    cheap to iterate.
+    Fusion is by RANK, not raw score (see ISSUES.md #1): BM25 scores
+    (~20-30) and cosine similarities (~0.5-0.7) live on incompatible
+    scales, so a raw weighted sum was dominated by keyword ~20x regardless
+    of the track weighting, and semantic-only candidates almost never
+    survived into the top-10 even when correctly retrieved. Reciprocal
+    Rank Fusion (score = weight / (RRF_K + rank)) is scale-free by
+    construction. Measured on 40 dev sessions: this alone took target
+    reaching the top-10 from 45.0% to 72.5% of the 72.5% ever retrieved —
+    i.e. it fixed essentially all of the ranking loss, not retrieval loss.
+
+    TODO (Person A): the 0.7/0.3 keyword/semantic weighting is still an
+    untuned first guess — now that both routes are on the same scale, it's
+    meaningful to tune it against the 200 dev sessions' scenario_metrics.
     """
-    keyword_hits = dict(index.keyword_candidates(query, top_n))
-    semantic_hits = dict(index.semantic_candidates(query, top_n))
+    keyword_hits = index.keyword_candidates(query, top_n)  # list[(asin, score)], best-first
+    semantic_hits = index.semantic_candidates(query, top_n)  # list[(asin, score)], best-first
 
     keyword_weight, semantic_weight = (0.7, 0.3) if track == "buying" else (0.3, 0.7)
     merged: dict[str, float] = {}
-    for asin, score in keyword_hits.items():
-        merged[asin] = merged.get(asin, 0.0) + keyword_weight * score
-    for asin, score in semantic_hits.items():
-        merged[asin] = merged.get(asin, 0.0) + semantic_weight * score
+    for rank, (asin, _score) in enumerate(keyword_hits):
+        merged[asin] = merged.get(asin, 0.0) + keyword_weight / (RRF_K + rank)
+    for rank, (asin, _score) in enumerate(semantic_hits):
+        merged[asin] = merged.get(asin, 0.0) + semantic_weight / (RRF_K + rank)
 
     candidate_ids = index.filter_candidates(filled_slots, list(merged.keys()))
     ranked_ids = sorted(candidate_ids, key=lambda asin: -merged[asin])[:top_n]
