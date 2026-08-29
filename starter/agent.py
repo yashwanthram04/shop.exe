@@ -16,7 +16,7 @@ from pathlib import Path
 from .clarify import pick_attribute_to_ask, pool_is_too_broad
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
-from .router import classify_track, detect_boundary, detect_override_signal, extract_slots
+from .router import classify_track, extract_slots
 from .state import SessionState
 
 EMPTY_RESPONSE = {
@@ -48,20 +48,22 @@ class Agent:
             return dict(EMPTY_RESPONSE)
 
     def _respond(self, state: SessionState, user_message: str, turn: int) -> dict:
-        state.override_detected = detect_override_signal(user_message)
-        if state.last_asked and detect_boundary(user_message):
-            state.close_attribute(state.last_asked)
+        state.advance_turn(turn)
+        # One call folds boundary/override/slot-extraction into state, and
+        # refreshes state.durable_notes — see router.py's module docstring
+        # for the full cross-team contract this satisfies.
+        extract_slots(state, user_message)
 
-        for attribute, value in extract_slots(user_message).items():
-            state.set_slot(attribute, value, turn)
-
-        track = classify_track(state, user_message)
-        candidates = retrieve(self.index, user_message, state.slots, track, top_n=50)
+        track = classify_track(state)
+        # state.durable_notes (slot summary + this turn's raw text) is what
+        # Person A's semantic_candidates() should embed — the AGENTS.md
+        # -flagged state->retrieval hookup.
+        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
 
         ask_attribute = None
         if pool_is_too_broad(len(candidates), track, turn):
             ask_attribute = pick_attribute_to_ask(state)
-        state.last_asked = ask_attribute
+        state.record_ask(ask_attribute)
         state.log_turn(turn, track, len(candidates), ask_attribute)
 
         ranked_ids = rank(candidates, state)
