@@ -51,6 +51,34 @@ class ClearFreeformOverrideTest(unittest.TestCase):
         state.clear_freeform_override(except_attribute="material")
         self.assertIn("style", state.filled_slots)
 
+    def test_also_removes_cleared_attribute_from_asked_categories(self) -> None:
+        state = SessionState(user_profile={})
+        state.set_slot("style", "casual", turn=1, source="freeform")
+        state.record_ask("style")  # asked about it later, reply didn't overwrite the freeform value
+        self.assertIn("style", state.asked_categories)
+        state.clear_freeform_override(except_attribute="material")
+        self.assertNotIn("style", state.asked_categories, "cleared attribute must be re-askable")
+
+    def test_also_removes_cleared_attribute_from_filled_null(self) -> None:
+        # Edge case: attribute disclosed unprompted (freeform), then later
+        # re-asked and drew a boundary reply -> ends up in both filled_slots
+        # and filled_null simultaneously. An override clearing it must not
+        # leave the stale filled_null entry behind.
+        state = SessionState(user_profile={})
+        state.set_slot("style", "casual", turn=1, source="freeform")
+        state.close_attribute("style")
+        self.assertIn("style", state.filled_null)
+        state.clear_freeform_override(except_attribute="material")
+        self.assertNotIn("style", state.filled_null, "cleared attribute must be re-askable, not stuck as no-preference")
+
+    def test_does_not_touch_asked_categories_for_unrelated_attributes(self) -> None:
+        state = SessionState(user_profile={})
+        state.set_slot("style", "casual", turn=1, source="freeform")
+        state.record_ask("style")
+        state.record_ask("budget")  # asked, never filled -> not freeform-cleared
+        state.clear_freeform_override(except_attribute="material")
+        self.assertIn("budget", state.asked_categories)
+
 
 class DecayedSlotsTest(unittest.TestCase):
     def test_asked_slots_decay_slower_than_freeform(self) -> None:

@@ -75,6 +75,23 @@ class ExtractSlotValuesUnpromptedTest(unittest.TestCase):
         slots = extract_slot_values("Those options are not quite right yet. Ask me about one specific attribute.")
         self.assertNotIn("feature", slots)
 
+    def test_hard_requirement_with_no_keyword_match_recovered_as_feature(self) -> None:
+        # A genuine Buying turn-1 constraint with no recognizable keyword —
+        # previously silently dropped (10% of real Buying sessions per audit).
+        slots = extract_slot_values(
+            "I'm looking for Earrings. A key requirement is: lightweight dangle design for everyday wear."
+        )
+        self.assertEqual(slots["feature"], "lightweight dangle design for everyday wear")
+
+    def test_hard_requirement_with_keyword_match_not_double_counted(self) -> None:
+        slots = extract_slot_values("I'm looking for Boots. A key requirement is: leather.")
+        self.assertEqual(slots["material"], "leather")
+        self.assertNotIn("feature", slots)
+
+    def test_still_exploring_tail_unaffected_by_the_new_fallback(self) -> None:
+        slots = extract_slot_values("I'm looking for clothing item, but I'm still exploring.")
+        self.assertNotIn("feature", slots)
+
 
 class ExtractSlotsStatefulEntryPointTest(unittest.TestCase):
     """Covers the D-facing contract: extract_slots(state, message) -> state,

@@ -82,12 +82,26 @@ class SessionState:
         old value came from: this evaluator's override always follows
         exactly one unprompted turn-1 disclosure (see AGENTS.md), so at
         override time there is at most one other freeform slot to clear.
+
+        Also drops the cleared attribute from `asked_categories` and
+        `filled_null`: both exist only to avoid re-asking something we
+        already have an answer (or a "no preference") for, and once the
+        value is erased here that premise no longer holds for either — an
+        attribute can end up in both `filled_slots` (freeform) and
+        `filled_null` if it was disclosed unprompted and *later* also drew a
+        boundary reply when re-asked; leaving either set stale would
+        permanently exclude a now-legitimately-unfilled attribute from ever
+        being asked again (confirmed with Person C — `open_attributes()`
+        treats `filled_null` as a hard, otherwise-unrecoverable exclusion).
         """
         for attribute, source in list(self.slot_source.items()):
             if source == "freeform" and attribute not in ("category", except_attribute):
                 self.filled_slots.pop(attribute, None)
                 self.slot_turn.pop(attribute, None)
                 self.slot_source.pop(attribute, None)
+                self.asked_categories.discard(attribute)
+                self.filled_null.discard(attribute)
+                self.asked_categories.discard(attribute)
 
     def close_attribute(self, attribute: str) -> None:
         """Customer has no preference for this attribute; stop asking about it."""

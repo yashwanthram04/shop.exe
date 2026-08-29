@@ -65,6 +65,11 @@ NO_MORE_TEMPLATE_RE = re.compile(r"^i don't have an additional preference for \w
 # The evaluator's fixed override template: "Actually, ignore my earlier
 # preference. What I need is: {new_value}."
 OVERRIDE_VALUE_RE = re.compile(r"what i need is:?\s*(.+?)\.?\s*$", re.IGNORECASE)
+# Buying's turn-1 message is the ONLY evaluator template containing this
+# exact phrase ("I'm looking for {category}. A key requirement is:
+# {constraint}.") — Browsing/Boundary's turn-1 tail and the null-ask nudge
+# never contain it, so trusting it is zero-risk, unlike a blind fallback.
+HARD_REQUIREMENT_RE = re.compile(r"a key requirement is:\s*(.+?)\.?\s*$", re.IGNORECASE)
 
 
 def _first_match(text: str, words: tuple[str, ...]) -> str | None:
@@ -95,6 +100,14 @@ def _classify_unprompted(message: str) -> dict[str, str]:
     the null-ask nudge "Those options are not quite right yet..."), and a
     blind default would poison a slot with that filler text. Missing a
     genuine feature this way is an accepted precision-over-recall tradeoff.
+
+    One narrow, zero-risk exception: text following the evaluator's exact
+    "A key requirement is:" phrase (Buying's turn-1 template — never present
+    in filler dialogue) IS trusted with a feature-default fallback, same as
+    `classify_single`. An audit against the 200 public sessions found this
+    clause was otherwise being silently dropped in 10% of Buying sessions
+    (no keyword match anywhere in the message) — this phrase is a safe,
+    explicit marker to recover it without loosening the general rule above.
     """
     text = message.lower()
     slots: dict[str, str] = {}
@@ -133,6 +146,13 @@ def _classify_unprompted(message: str) -> dict[str, str]:
     brand_match = BRAND_RE.search(message)
     if brand_match:
         slots["brand"] = brand_match.group(1).strip()
+
+    requirement_match = HARD_REQUIREMENT_RE.search(message)
+    if requirement_match:
+        classified = classify_single(requirement_match.group(1))
+        if classified:
+            attribute, value = classified
+            slots.setdefault(attribute, value)
 
     return slots
 
