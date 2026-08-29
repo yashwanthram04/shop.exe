@@ -308,6 +308,8 @@ def apply_filters(candidates, filled_slots):
 ```
 `SOFT_BOOST_WEIGHT` is a tunable constant (§6.5).
 
+**Edge case — zero-pool safety net:** see §10.2 for the mandatory recovery step when hard filtering ever empties the candidate pool.
+
 ---
 
 ### 3.9 Candidate Merge, Adaptive Pool Sizing, and Personalization Tie-Break
@@ -400,8 +402,9 @@ def diversity_score(pool, category):
     probs = [n / len(values) for n in counts.values()]
     return -sum(p * math.log(p) for p in probs)   # Shannon entropy; distinct-count is an acceptable simpler fallback
 ```
-- `CONFIDENCE_POOL_THRESHOLD` is a tuned constant (§6.5), starting guess: `top_k` itself (i.e., if the pool is already ≤10, don't bother asking — just recommend).
+- `CONFIDENCE_POOL_THRESHOLD` is a tuned constant (§6.5), starting guess: `top_k` itself (i.e., if the pool is already ≤10, don't bother asking — just recommend). **Superseded by §10.4:** this is not a single fixed constant but a threshold that loosens as `state["turn"]` increases, and Rule D is forced (`ask_attribute: null`) unconditionally from turn 8 onward regardless of pool size.
 - Categories in `state["asked_categories"]` that later got a no-preference response are moved to `filled_null` (via §3.4's `explicit_no_preference`) and are excluded from `unfilled` on all future turns — this is the "treat it as filled-null, not unfilled" rule from your original notes.
+- **Pool-shrink recovery (§10.3):** before Rule C's entropy scoring runs, `unfilled` is additionally filtered to drop any category flagged by the pool-shrink tracker in §10.3 (i.e., a category the agent already asked about this session that did not measurably narrow the pool).
 
 ---
 
@@ -455,6 +458,7 @@ Deterministic instrumentation, every turn:
 - Sum `prompt_tokens`/`completion_tokens` across every LLM call actually made this turn (combined call + reranker + any escalation call) into the `usage` field.
 - Log per-call latency locally (not returned to evaluator) for the team's own cost/latency disclosure in the final report.
 - Log fallback-trigger events (which call site, why) to support the "offline fallback" disclosure required by `submission_rules.md`.
+- **Local debug log (§10.6):** in addition to the above, emit one structured per-turn debug record — mode, filled slots, which attribute won entropy scoring and why, retrieval channel used, pool size before/after filtering, and whether any fallback fired. Local-only, never sent to the evaluator; built in week one since it costs nothing at runtime.
 
 ---
 
@@ -544,6 +548,13 @@ class Agent:
 | G | Context window | Sliding window + slot state | Bounded cost, retains recent nuance |
 | H | Reranker pool size | Adaptive | Balances recall vs cost by constraint confidence |
 | I | `ask_attribute` decision locus | Fully deterministic | Reproducible, directly tunable, protects scored metrics |
+| J | Scenario handler coverage | Scoped to the four official scenarios only; no comparison-request or stalled/confused handlers | Simulated customer never reacts to specific recommendations and won't produce true out-of-distribution scenarios — extra handlers are unexercised complexity |
+| K | Empty-pool recovery | Immediate drop of the most recently applied hard filter, re-retrieve, before anything else that turn | A zero pool is the single worst failure mode (zero hit chance for the rest of the session) |
+| L | Bad-turn recovery signal | Pool-shrink tracking, not a full self-critique loop | Self-critique is hard to calibrate and a miscalibrated version can actively hurt performance; pool-shrink is a cheap, auditable proxy |
+| M | Clarification aggressiveness over time | Turn-budget-driven threshold curve (loosens turns 5–7, forced recommend-only turn 8+) | A miss costs the same on turn 8 as turn 10, but extra questions tax Efficiency directly |
+| N | State-change triggers | Auditable only: new fact learned, turn threshold crossed, zero-pool event — never a soft/subjective signal | Prevents a second, uncontrolled axis of adaptivity that would cause erratic flip-flopping |
+| O | Local debug log (explainability) | Per-turn structured log, local-only, built in week one | Costs nothing at runtime; pays for itself the first time a session needs tracing during tuning |
+| P | Overall strategy shape | Named-policy backbone (scoped to 4 scenarios) + turn-budget aggressiveness, with two narrow confidence-gating tripwires (zero-pool, pool-shrink); full self-critique loop explicitly rejected | Matches a scripted, non-adaptive simulated customer — general-purpose adaptivity is unrewarded complexity |
 
 ---
 
@@ -577,8 +588,128 @@ class Agent:
 These are intentionally **not** finalized in this PRD — they require empirical tuning against the 200 public sessions before final submission:
 
 1. Exact hybrid merge weights (BM25 / dense / popularity / profile-tiebreak)
-2. `CONFIDENCE_POOL_THRESHOLD` value
+2. `CONFIDENCE_POOL_THRESHOLD` per-band values (turns 1–4 / 5–7 / 8+) — §10.4 fixes the shape of the curve, not the numbers
 3. Adaptive pool-size formula constants
 4. `SOFT_BOOST_WEIGHT` and `TIEBREAK_EPSILON` magnitudes
 5. Whether the override-invalidation graph (§3.6) needs additional edges beyond the starter table
 6. Per-scenario metric breakdown to check whether any one scenario type is dragging down aggregate `TechnicalScore` disproportionately
+7. What counts as "didn't shrink meaningfully" for the pool-shrink recovery signal (§10.3) — an absolute count drop vs. a percentage threshold
+8. Whether the turn-band boundaries themselves (4 / 7 / 8) hold up against the 200 public sessions, or need shifting per-scenario
+
+---
+
+## 10. Addendum: General Robustness Decisions
+
+This addendum resolves the remaining "how adaptive should the agent be" question left open by the Decision Register (§6) and layers a small set of robustness rules onto the components already specified in §3. Nothing here replaces §3.6, §3.8, §3.11, or §3.14 — each subsection below states exactly which existing spec it extends. Decision Register rows J–P (§6) summarize these.
+
+### 10.1 Scenario Coverage Boundaries
+
+**Decision (J):** No handlers beyond the four official scenario types (Buying, Browsing, Intent Override, Boundary, per §1).
+
+**Rationale:** The simulated customer never reacts to a specific recommendation the agent makes, so comparison requests ("which is more durable") are out of distribution for this evaluator and building a handler for them is speculative complexity with no scoring upside. Similarly, a "stalled/confused" customer is not a distinct scenario — it is the degenerate case of Browsing where several turns in a row fail to fill any slot. It doesn't need its own branch; it needs the existing Browsing path to degrade gracefully (bounded latency, no crash, no infinite re-asking of the same category) under repeated zero-fill turns.
+
+**Spec:**
+- Do not add a comparison-request intent or handler.
+- Do not add a separate stalled/confused mode or state field. Verify instead, as part of local evaluation (§4.5), that a run of several consecutive turns with zero newly-filled slots still produces valid, non-repeating `ask_attribute` choices and does not loop or stall — this is a test case against the existing Browsing path, not new production code.
+
+---
+
+### 10.2 Zero-Pool Safety Net
+
+**Decision (K):** If the candidate pool ever reaches zero after hard filtering (§3.8), the agent immediately drops the most recently applied hard filter and re-retrieves, before doing anything else that turn.
+
+**Rationale:** An empty candidate pool means zero hit probability for every remaining turn in the session — this is strictly the worst failure mode the agent can enter, worse than any single bad recommendation, so it gets priority over every other per-turn rule including clarification selection (§3.11) and reranking (§3.10).
+
+**Spec:**
+```python
+def retrieve_with_safety_net(state, filled_slots):
+    filter_order = state.get("hard_filter_apply_order", [])  # most-recent last
+    candidates = apply_filters(retrieve(state, filled_slots), filled_slots)
+    while not candidates and filter_order:
+        dropped = filter_order.pop()
+        filled_slots = {**filled_slots, dropped: None}
+        candidates = apply_filters(retrieve(state, filled_slots), filled_slots)
+    return candidates, filled_slots
+```
+- This runs inline in the retrieval step (§3.7/§3.8), ahead of pool sizing (§3.9) and clarification selection (§3.11) — both of those assume a non-empty pool.
+- The dropped filter is not permanently discarded from `state["filled_slots"]` for future turns — only the retrieval call for this turn is re-run against the relaxed constraint set. If the same filter causes a zero pool again next turn, the safety net fires again independently.
+- Log every trigger of this path via §10.6's debug log — a filter that repeatedly causes zero-pool events is a signal that slot extraction (§3.4/§3.5) is likely mis-parsing that field.
+
+---
+
+### 10.3 Pool-Shrink Recovery Signal (Bad-Turn Recovery)
+
+**Decision (L):** Track candidate pool size before vs. after applying each turn's new customer answer. If the pool did not shrink meaningfully, stop asking about that attribute category again this session — even if entropy scoring (§3.11 Rule C) would otherwise re-select it. This replaces a full self-critique/self-correction loop, which was explicitly rejected.
+
+**Rationale:** A general self-critique loop, where the agent re-evaluates and potentially reverses its own prior turns, is hard to calibrate correctly, and a miscalibrated version can make the agent actively worse than doing nothing — it adds a second, harder-to-audit source of behavior change on top of the deterministic pipeline the rest of this PRD is built around (§3.11's rationale). Pool-shrink tracking gets most of the same practical benefit — noticing that a line of questioning isn't working — as a simple, cheap, fully auditable signal instead.
+
+**Spec:**
+```python
+def update_pool_shrink_tracker(state, category, pool_size_before, pool_size_after):
+    if pool_size_after >= pool_size_before:  # exact "meaningful" threshold tuned per §9 item 7
+        state.setdefault("unproductive_categories", set()).add(category)
+```
+- `unproductive_categories` is checked by §3.11's `select_ask_attribute` before Rule C entropy scoring runs (see the updated §3.11 spec) — any category in this set is excluded from `unfilled` for the rest of the session.
+- This is a permanent, one-way exclusion per session (no re-enabling), consistent with §10.5's rule that state changes only on an auditable trigger — the trigger here is "answering this category did not narrow the pool," which is itself auditable and logged.
+- Interacts with §3.6 (override-invalidation graph): if a category is cleared back to unfilled by an override, it is also removed from `unproductive_categories`, since the invalidation represents new information that makes the earlier non-shrink observation stale.
+
+---
+
+### 10.4 Turn-Budget-Driven Clarification Threshold
+
+**Decision (M):** `CONFIDENCE_POOL_THRESHOLD` (§3.11) is not a single fixed constant — it loosens as the session's turn budget runs out, and clarification is force-disabled outright once turns run low.
+
+**Rationale:** A missed hit costs the objective function the same whether it happens on turn 8 or turn 10, but every additional clarification question directly taxes `Efficiency` (20% of `TechnicalScore`, via `MTTC`, §1). Early turns can afford to spend a question narrowing the pool; late turns cannot — the expected value of one more question turns negative well before the 10-turn cap.
+
+**Spec:**
+```python
+def confidence_pool_threshold(turn):
+    if turn <= 4:
+        return BASE_THRESHOLD                    # ask freely — tuned per §9 item 2
+    elif turn <= 7:
+        return BASE_THRESHOLD * RAISED_MULTIPLIER  # lean toward recommending — tuned per §9 item 2
+    else:
+        return float("inf")                       # unreachable in practice, see below
+
+def select_ask_attribute(state, candidate_pool):  # supersedes the Rule B/D check in §3.11
+    if state["turn"] >= 8:
+        return None   # force recommend-only, no exceptions
+    ...
+    if len(candidate_pool) <= confidence_pool_threshold(state["turn"]):
+        return None
+    ...
+```
+- Turn bands (1–4 free, 5–7 raised, 8+ forced-off) and the exact `BASE_THRESHOLD`/`RAISED_MULTIPLIER` values are starting guesses, tunable against the 200 public sessions per §4.5 and tracked as open items (§9, items 2 and 8).
+- This directly modifies the §3.11 spec's Rule B and Rule D — Rule D becomes unconditional from turn 8 onward regardless of `unfilled` or pool size.
+
+---
+
+### 10.5 State-Change Discipline (Consistency vs. Adaptivity)
+
+**Decision (N):** Formalize, as an explicit rule, behavior already implied by §3's design: session state changes only on an auditable trigger — a new fact learned (§3.4 slot merge), a turn-count threshold crossed (§10.4), or a zero-pool event (§10.2). Never on a soft or subjective signal (e.g., an LLM's own confidence score, sentiment, or a heuristic "this seems off" judgment).
+
+**Rationale:** Every adaptive mechanism in this PRD — mode re-derivation (§3.7), the invalidation graph (§3.6), pool-shrink tracking (§10.3), and the turn-budget curve (§10.4) — is deliberately built on deterministic, loggable triggers. Adding a second, independent axis of adaptivity driven by a soft signal (e.g., a self-assessed confidence score gating extra behavior changes) is exactly the kind of change that causes erratic flip-flopping between turns, undermining both reproducibility and the debuggability the rest of the architecture optimizes for.
+
+**Spec:** No new code — this is a design constraint on future changes to this PRD. Any new adaptive behavior proposed after this point must name its trigger and show that trigger is one of: a slot value change, a turn-count boundary, a zero-pool event, or a pool-shrink observation. A proposal whose trigger is a model-reported confidence/certainty score should be rejected or redesigned around one of the above instead.
+
+---
+
+### 10.6 Explainability: Local Debug Log
+
+**Decision (O, telemetry extension of §3.14):** Emit a per-turn local debug log, separate from the `usage` field returned to the evaluator, recording: current mode, filled slots, which attribute won entropy scoring and why (including anything excluded by §10.3's `unproductive_categories`), which retrieval channel was used, candidate pool size before and after filtering (including any §10.2 safety-net triggers), and whether any fallback (§3.13) fired.
+
+**Rationale:** This costs nothing at runtime — it's a local log write, not a network call or scored field — and pays for itself the first time a session's behavior needs to be traced back to a specific decision point during tuning (§4.5) or debugging a bad local-eval run. Building it in week one, before the rest of the pipeline is fully tuned, means every subsequent debugging session benefits from it rather than only the ones built after some debugging pain motivates it.
+
+**Spec:** See the updated §3.14 spec for the log fields; implementation is a plain structured log write (e.g., one JSON line per turn to a local file), gated off entirely in the submitted evaluator-facing output.
+
+---
+
+### 10.7 Overall Strategy Synthesis
+
+**Decision (P):** The agent's overall adaptivity strategy is layered, not monolithic:
+- **Backbone:** a named-policy approach, scoped only to the four official scenarios (§10.1) — not a general-purpose scenario library, since the simulator will not produce out-of-scope scenarios.
+- **Layered on top:** turn-budget-driven aggressiveness (§10.4), shifting the clarification/recommend balance as the turn cap approaches.
+- **Two narrow tripwires**, borrowed from confidence-gating thinking but deliberately not generalized into a full confidence score: the zero-pool safety net (§10.2) and the pool-shrink recovery signal (§10.3).
+- **Explicitly excluded:** a full self-critique/self-correction loop. The complexity and erratic-behavior risk (§10.3's rationale, §10.5) isn't justified against a scripted, non-adaptive simulated customer — there is no adversarial or evolving counterpart for a self-critique loop to be correcting against.
+
+**Rationale:** This combination targets the specific failure modes the objective function (§1) actually penalizes — permanent pool exhaustion, wasted questions late in a session, and repeatedly asking about an attribute that isn't narrowing the search — without introducing an adaptive mechanism whose behavior is harder to predict or tune than the failure modes it would guard against.
