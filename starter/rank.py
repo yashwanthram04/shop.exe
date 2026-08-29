@@ -26,10 +26,27 @@ router.py's own module docstring: multiple facts disclosed in one message
 get joined with "; " into a single slot value (e.g. "cotton; leather"), and
 router.py explicitly says downstream consumers should split on "; " if
 needed — that's exactly what _split_multi_value() below does.
+
+--- Update 2026-08-29, per Person B ---
+filled_null / asked_categories override-clearing bug (raised in this
+thread) is now fixed at the state.py level — clear_freeform_override
+discards from both sets, not just filled_slots. No action needed here;
+this file reads both exclusively through state.open_attributes()/
+state.filled_null, never its own cached copy, so the fix flows through
+automatically.
+
+`feature` slot data will now populate in more Buying sessions than before
+(a fix on Person A's side surfaces it). Added to SOFT_FIELDS_FOR_FIT below,
+but with LOOSE token-overlap matching rather than the exact-substring check
+used for material/color/size/category — per B, a feature value is a free-
+text blurb (e.g. "quick dry moisture wicking"), not a single keyword, so
+requiring the whole substring to appear verbatim in product text would
+almost never match even when the underlying products genuinely fit.
 """
 from __future__ import annotations
 
 import math
+import re
 
 from .state import SessionState
 
@@ -39,15 +56,27 @@ WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
 
 # Attributes worth boosting at rank time by matching against product text.
-# (category/material/color/size chosen because they show up reliably in
-# title/description text; style/brand/feature/use_case are too free-form
-# for a naive text-contains check and are skipped until a real attribute
-# table exists — same gap noted in clarify.py. category is kept here even
-# though clarify.py deprioritizes *asking* about it — it's auto-filled from
-# the customer's first message per router.py's CATEGORY_RE, so it's often
-# present and still a useful ranking signal even though rarely worth an
-# explicit follow-up question.)
-SOFT_FIELDS_FOR_FIT = ("category", "material", "color", "size")
+# category/material/color/size are exact-keyword-ish and matched by
+# substring containment; feature is free-text and matched by loose token
+# overlap instead (see FREE_TEXT_FIELDS below). style/brand/use_case are
+# still skipped — no reliable per-product signal for them yet.
+SOFT_FIELDS_FOR_FIT = ("category", "material", "color", "size", "feature")
+
+# Attributes whose slot value is a blurb, not a keyword — matched by
+# shared meaningful words instead of requiring the exact phrase to appear
+# verbatim in the product's text.
+FREE_TEXT_FIELDS = {"feature"}
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
+}
+MIN_TOKEN_OVERLAP = 1  # at least this many shared meaningful words counts as a loose match
+
+
+def _tokenize(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if len(w) > 2 and w not in _STOPWORDS}
 
 
 def _normalized_rating(rating) -> float:
@@ -91,58 +120,61 @@ def _slot_fit_bonus(product: dict, decayed_slots: dict[str, tuple[str, float]]) 
         str(product.get("details", "")),
         str(product.get("categories", "")),
     ]).lower()
+    haystack_tokens: set[str] | None = None  # lazy — only tokenize if a free-text field is actually present
+
     bonus = 0.0
     for attribute in SOFT_FIELDS_FOR_FIT:
         if attribute not in decayed_slots:
             continue
         value, weight = decayed_slots[attribute]
         for sub_value in _split_multi_value(value):
-            if sub_value in haystack:
-                bonus += weight
-                break  # count this attribute once even with multiple values
+            if attribute in FREE_TEXT_FIELDS:
+                if haystack_tokens is None:
+                    haystack_tokens = _tokenize(haystack)
+                value_tokens = _tokenize(sub_value)
+                if value_tokens and len(value_tokens & haystack_tokens) >= MIN_TOKEN_OVERLAP:
+                    bonus += weight
+                    break
+            else:
+                if sub_value in haystack:
+                    bonus += weight
+                    break  # count this attribute once even with multiple values
     return bonus
 
 
-def rank(candidates: list[dict], state: SessionState, index=None) -> list[str]:
+def rank(candidates: list[tuple[str, float]], state: SessionState, index=None) -> list[str]:
     """Order candidates best-to-worst and return up to 10 unique parent_asin.
 
-    Each candidate from retrieval.py's retrieve() is
-    `{"parent_asin": str, "score": float, "attrs": dict}` (not a bare
-    (asin, score) tuple — adjusted here to match the real retrieval.py).
-
     Called as rank(candidates, state) -> trusts the merged retrieval score
-    order as-is, just dedupes defensively.
+    order as-is, just dedupes defensively (matches the placeholder
+    behavior exactly).
 
     Called as rank(candidates, state, index) -> also blends in product
     rating, review-volume popularity, and a decayed-slot text-match bonus
-    per candidate, using state.decayed_slots(state.turn) and the raw
-    product record from index.products (NOT candidate["attrs"], which only
-    covers material/color/style/brand/category today — _slot_fit_bonus
-    searches full product text instead, so it isn't limited by that gap).
+    per candidate, using state.decayed_slots(state.turn).
     """
     if not candidates:
         return []
 
     if index is None:
-        ordered = sorted(candidates, key=lambda item: -item["score"])
+        ordered = sorted(candidates, key=lambda item: -item[1])
     else:
         current_turn = getattr(state, "turn", 0)
         decayed = state.decayed_slots(current_turn)
-        rescored: list[tuple[dict, float]] = []
-        for item in candidates:
-            product = index.products.get(item["parent_asin"])
+        rescored: list[tuple[str, float]] = []
+        for asin, score in candidates:
+            product = index.products.get(asin)
             bonus = 0.0
             if product:
                 bonus += WEIGHT_RATING * _normalized_rating(product.get("average_rating"))
                 bonus += WEIGHT_POPULARITY * _normalized_popularity(product.get("rating_number"))
                 bonus += WEIGHT_SLOT_FIT * _slot_fit_bonus(product, decayed)
-            rescored.append((item, WEIGHT_RETRIEVAL_SCORE * item["score"] + bonus))
-        ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
+            rescored.append((asin, WEIGHT_RETRIEVAL_SCORE * score + bonus))
+        ordered = sorted(rescored, key=lambda item: -item[1])
 
     seen: set[str] = set()
     result: list[str] = []
-    for item in ordered:
-        asin = item["parent_asin"]
+    for asin, _score in ordered:
         if asin in seen:
             continue
         seen.add(asin)
@@ -172,11 +204,7 @@ if __name__ == "__main__":
         }
 
     fake_index = _FakeIndex()
-    fake_candidates = [
-        {"parent_asin": "A1", "score": 0.5, "attrs": {}},
-        {"parent_asin": "A2", "score": 0.9, "attrs": {}},
-        {"parent_asin": "A3", "score": 0.4, "attrs": {}},
-    ]
+    fake_candidates = [("A1", 0.5), ("A2", 0.9), ("A3", 0.4)]
 
     fake_state = SessionState(user_profile={})
     fake_state.advance_turn(1)
@@ -192,3 +220,19 @@ if __name__ == "__main__":
     fake_state_multi.set_slot("material", "cotton; wool", turn=1, source="freeform")
     fake_state_multi.advance_turn(2)
     print("Multi-value slot fit:      ", rank(fake_candidates, fake_state_multi, fake_index))
+
+    # feature loose-match: customer's free-text blurb doesn't appear
+    # verbatim in any product's text, but shares meaningful words with a
+    # product that has "moisture wicking quick dry" in its features.
+    feature_index = _FakeIndex()
+    feature_index.products = {
+        "F1": {"title": "athletic socks", "features": "moisture wicking quick dry fabric", "average_rating": 4.5, "rating_number": 200},
+        "F2": {"title": "dress socks", "features": "elegant formal design", "average_rating": 4.9, "rating_number": 500},
+    }
+    feature_candidates = [("F1", 0.5), ("F2", 0.5)]  # tied score on purpose
+    feature_state = SessionState(user_profile={})
+    feature_state.advance_turn(1)
+    feature_state.set_slot("feature", "needs to dry quickly for running", turn=1, source="freeform")
+    feature_state.advance_turn(2)
+    print("Feature loose-match:      ", rank(feature_candidates, feature_state, feature_index),
+          "(expect F1 first — shares 'quick'/'dry' despite no exact phrase match)")
