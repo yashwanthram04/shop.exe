@@ -13,6 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ, if present
+
 from .clarify import pick_attribute_to_ask, pool_is_too_broad
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
@@ -56,13 +60,13 @@ class Agent:
 
         track = classify_track(state)
         # state.durable_notes (slot summary + this turn's raw text) is what
-        # Person A's semantic_candidates() should embed — the AGENTS.md
-        # -flagged state->retrieval hookup.
+        # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
+        # hookup, now built once in state.py rather than duplicated here.
         candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
 
         ask_attribute = None
         if pool_is_too_broad(len(candidates), track, turn):
-            ask_attribute = pick_attribute_to_ask(state)
+            ask_attribute = pick_attribute_to_ask(candidates, state)
         state.record_ask(ask_attribute)
         state.log_turn(turn, track, len(candidates), ask_attribute)
 

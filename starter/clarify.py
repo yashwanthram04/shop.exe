@@ -13,8 +13,13 @@ from .state import SessionState
 # TODO (Person C): tune these against the 200 dev sessions' scenario_metrics.
 BROAD_POOL_THRESHOLD = {"buying": 15, "browsing": 40}
 
+# NOTE: "category" deliberately excluded. router.py's extract_slots never
+# fills it, and the evaluator's simulated customer never discloses a fact
+# classified as "category" either (see AGENTS.md) — asking about it is a
+# guaranteed dead-end turn that can never be satisfied, which previously
+# caused the agent to ask the same unanswerable question every turn.
 ASK_PRIORITY = (
-    "category", "budget", "color", "material",
+    "budget", "color", "material",
     "size", "style", "brand", "use_case", "feature",
 )
 
@@ -32,14 +37,20 @@ def pool_is_too_broad(candidate_count: int, track: str, turn: int) -> bool:
     return candidate_count > threshold
 
 
-def pick_attribute_to_ask(state: SessionState) -> str | None:
+def pick_attribute_to_ask(pool: list[dict], state: SessionState) -> str | None:
     """Which ask_attribute is most worth spending this turn on.
 
+    `pool` is retrieval.py's candidate list — each item is
+    `{"parent_asin": str, "score": float, "attrs": dict}`, where `attrs`
+    holds that product's parsed material/color/style/brand/category.
+
     Placeholder: fixed priority order over open (unfilled, non-boundary)
-    attributes. TODO (Person C): replace with an info-gain style choice —
-    given the current candidate pool, which open attribute would split it
-    the most if we knew the answer? That requires looking at the actual
-    candidate products' fields, not just the fixed priority list.
+    attributes, ignoring `pool` entirely. TODO (Person C): replace with an
+    info-gain style choice — for each open attribute, look at the spread of
+    `attrs[attribute]` values across `pool` (e.g. via Counter) and pick
+    whichever attribute would split the current pool the most evenly if we
+    knew the customer's answer, rather than always asking in the same fixed
+    order regardless of what's actually still ambiguous.
     """
     open_attributes = set(state.open_attributes())
     for attribute in ASK_PRIORITY:
