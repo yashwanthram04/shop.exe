@@ -13,10 +13,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .clarify import pick_attribute_to_ask, pool_is_too_broad
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ, if present
+
+from .clarify import pick_attribute_to_ask
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
-from .router import classify_track, detect_boundary, detect_override_signal, extract_slots
+from .router import classify_track, extract_slots
 from .state import SessionState
 
 EMPTY_RESPONSE = {
@@ -40,31 +44,38 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         try:
-            return self._respond(state, user_message, turn)
+            return self._respond(state, user_message, turn, top_k)
         except Exception:
             # A crash counts as a miss for this session regardless (see
             # AGENTS.md) — fail safe with a valid empty response instead of
             # raising, so one bad turn doesn't corrupt the whole run.
             return dict(EMPTY_RESPONSE)
 
-    def _respond(self, state: SessionState, user_message: str, turn: int) -> dict:
-        state.override_detected = detect_override_signal(user_message)
-        if state.last_asked and detect_boundary(user_message):
-            state.close_attribute(state.last_asked)
+    def _respond(self, state: SessionState, user_message: str, turn: int, top_k: int) -> dict:
+        state.advance_turn(turn)
+        # One call folds boundary/override/slot-extraction into state, and
+        # refreshes state.durable_notes — see router.py's module docstring
+        # for the full cross-team contract this satisfies.
+        extract_slots(state, user_message)
 
-        for attribute, value in extract_slots(user_message).items():
-            state.set_slot(attribute, value, turn)
+        track = classify_track(state)
+        # state.durable_notes (slot summary + this turn's raw text) is what
+        # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
+        # hookup, now built once in state.py rather than duplicated here.
+        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
 
-        track = classify_track(state, user_message)
-        candidates = retrieve(self.index, user_message, state.slots, track, top_n=50)
-
-        ask_attribute = None
-        if pool_is_too_broad(len(candidates), track, turn):
-            ask_attribute = pick_attribute_to_ask(state)
-        state.last_asked = ask_attribute
+        # pick_attribute_to_ask now owns the "should I even ask" gate
+        # internally (Rule C, formerly the standalone pool_is_too_broad
+        # call here) as well as which attribute to ask about (Rule D) and
+        # the boundary-just-fired skip (Rule A, auto-detected from state).
+        ask_attribute = pick_attribute_to_ask(candidates, state, top_k)
+        state.record_ask(ask_attribute)
         state.log_turn(turn, track, len(candidates), ask_attribute)
 
-        ranked_ids = rank(candidates, state)
+        # index=self.index opts into rating/popularity/slot-fit scoring
+        # (see the note at the bottom of rank.py) instead of raw retrieval
+        # score order alone.
+        ranked_ids = rank(candidates, state, index=self.index)
         message = (
             f"Do you have a {ask_attribute} preference?"
             if ask_attribute
