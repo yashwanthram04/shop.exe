@@ -122,6 +122,22 @@ def _classify_unprompted_llm(message: str, usage: dict | None) -> dict[str, str]
     prompt/completion token counts — this is a genuine model call, not a
     $0 heuristic, and the contract's `usage` field should reflect that.
     """
+    # Opt-in, not merely key-present. Measured on the 200 public sessions
+    # (ISSUES.md #9): LLM extraction scores 0.8370 vs 0.8400 for the
+    # regex path — no better, and it costs network dependency, latency,
+    # per-run non-determinism, and money. Two structural reasons it loses
+    # against THIS evaluator, whose customer messages are template-
+    # generated and highly regular:
+    #   1. It correctly reads "but I'm still exploring" as expressing no
+    #      preference and returns {} — discarding the category, which is
+    #      the one signal every turn-1 message reliably carries. Every
+    #      Browsing session uses that phrasing.
+    #   2. It normalizes/truncates ("watches wrist watches" -> "Watches"),
+    #      losing retrieval specificity the verbatim regex value keeps.
+    # Kept available because it is the genuinely right tool for real,
+    # messy user input — just not for this simulator.
+    if os.environ.get("USE_LLM_EXTRACTION", "").strip().lower() not in ("1", "true", "yes"):
+        return None
     if not os.environ.get("GROQ_API_KEY"):
         return None
     try:

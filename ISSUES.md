@@ -13,8 +13,18 @@ not estimates. Where a run used a subset, the sample size is stated.
 | + Issue 2 ("other" probe) | 0.7891 |
 | + Issue 5 (confirmed neutral, LLM extraction kept on) | 0.7903 |
 | + Issue 7 (override merge fix) | **0.7964** |
+| + chaithra/retrieval-fixes branch (query pollution, override guard, RRF weights) | 0.8041 |
+| + Issue 8 (never return `None`) | 0.8193 |
+| + Issue 10 (stop re-recommending disproven products) | **0.8400** |
 
-Remaining open: Issue 3 (retrieval ceiling), Issue 6 (attrs coverage).
+All scores above are measured with LLM extraction OFF, which is now the
+default (see Issue 9). Earlier numbers in this file that were taken with
+Groq enabled are not directly comparable — Groq was silently failing on a
+variable fraction of calls, making those runs non-reproducible.
+
+Remaining open: Issue 3 (retrieval ceiling) — now the dominant limit, see
+Issue 10's measurement. Issue 6 (attrs coverage) is deliberately NOT being
+fixed; see Issue 8.
 
 Reference numbers from a 40-session instrumented replay (Groq disabled, so
 these are independent of any LLM behaviour):
@@ -272,6 +282,106 @@ value was `"X"`; fixed to keep the fuller existing string in that case).
 retrieval pool at all regardless of this fix — likely Issue 3 (retrieval
 ceiling), not an override problem. Worth another pass once Issue 3 is
 addressed.
+
+---
+
+## Issue 8 — `ask_attribute: None` dead-ends every missed session 🔴 CRITICAL
+
+**Status:** ✅ fixed. 0.8041 → **0.8193** (Boundary 90→100%, Override 80→90%).
+
+Found by reading `transcripts.log`. **All 35 missed sessions ended in a
+trailing run of `None`**, mean 4.69 dead turns each, 164 turns total.
+`None` appeared 171× in misses vs 24× in hits. The evaluator answers
+`None` with *"Those options are not quite right yet..."* — zero
+information — so those sessions were over by ~turn 6 but burned to 10.
+
+**Root cause chain:** `_extract_attrs()` populates only 5 of 9 attributes,
+so `size`/`budget`/`feature`/`use_case` always score 0.0 coverage and can
+never clear `MIN_COVERAGE_TO_ASK`. Once the 5 covered ones are used and
+the `other_asked_count` cap of 2 is spent, Rule D's `scored` list is empty
+and the function returned `None` permanently.
+
+**Fix:** `None` is now reserved for Rule A (boundary just fired) alone.
+Rules B/C/D all fall back to `"other"`, which per
+`evaluator/local_evaluator.py:178-181` matches ANY undisclosed fact
+(the `attribute == "other"` short-circuit) and so is never worse than a
+named ask. Also dropped `HARD_STOP_ASK_TURN`, which forced `None` on turns
+8-10. Asking is free — `ask_attribute` and `recommendations` ship in the
+same response and MTTC only counts the hit turn.
+
+**Note on Issue 6:** extending `_extract_attrs` coverage is deliberately
+NOT the fix here, and would likely be counterproductive — it would let
+Rule D select a *named* attribute where it now falls back to `"other"`,
+and named attributes are strictly dominated. Left open but downgraded.
+
+Verified directly: trailing-`None` runs went from 35/35 missed sessions to
+**0/12**; remaining `None`s are all Rule A, which is correct.
+
+---
+
+## Issue 9 — LLM slot extraction is not worth its cost 🟡 MEDIUM
+
+**Status:** ✅ resolved — now opt-in via `USE_LLM_EXTRACTION`, off by default.
+
+Measured on identical code, only Groq toggled:
+
+| | LLM off | LLM on |
+|---|---|---|
+| TechnicalScore | **0.8400** | 0.8370 |
+| Browsing hit rate | **95%** | 93.75% |
+| Tokens (200 sessions) | 0 | 2,172 |
+
+**Two structural reasons it loses here** (verified by diffing extractor
+outputs on real turn-1 messages, not inferred):
+
+1. It reads *"but I'm still exploring"* as expressing no preference and
+   returns `{}` — correct semantically, but it discards the **category**,
+   the one signal every turn-1 message reliably carries. Every Browsing
+   session uses that phrasing, which is why Browsing regressed most.
+2. It normalizes/truncates: `"watches wrist watches"` → `"Watches"`,
+   losing the retrieval specificity the verbatim regex value keeps.
+
+Neither is a capacity problem — a paid tier fixes neither. This evaluator's
+messages are template-generated and highly regular, so regex handles them
+near-perfectly while the LLM's instinct to normalize destroys the verbatim
+signal the pipeline depends on.
+
+**Also fixed a reproducibility trap:** an earlier measurement put this at
+"+0.001, noise". That run was invalid — Groq was silently failing on most
+calls (5,421 tokens where ~46,000 were expected), so it was mostly
+measuring the regex path. Any `except: return None` fallback around a
+network call makes runs non-deterministic; compare only against explicit
+LLM-off runs.
+
+---
+
+## Issue 10 — Agent re-recommends products already proven wrong 🟠 HIGH
+
+**Status:** ✅ fixed. 0.8193 → **0.8400** (MRR 0.6397 → **0.6867**).
+
+Spotted by reading transcripts: the agent showed the same top-10 turn after
+turn. If a product was in a scored top-10 and the session did NOT end, it
+is *provably* not the target — the evaluator ends the session the instant
+the target appears. Re-showing it spends a slot that can never pay off. Over
+10 turns this capped total coverage at ~10 products instead of up to 100.
+
+**Fix:** `SessionState.record_shown()` tracks shown products; `rank()`
+demotes them to the back of the list (demote, not drop — the list stays a
+full 10 even once the pool is exhausted). Verified: consecutive turns now
+share **0** recommendations instead of 10.
+
+**Critical caveat — the override gate.** The "it didn't end, so it's wrong"
+deduction is FALSE before an intent override fires, because the evaluator
+refuses to score any hit until then (`override_applied`). Two missed
+sessions had the target at pool positions **1 and 2** — ranked correctly,
+just shown too early to count. Blind exclusion would have discarded the
+right answer permanently. `state.clear_shown()` therefore wipes the history
+whenever an override is detected.
+
+**Measurement that reframes the remaining work:** of 28 misses probed, only
+**6** had the target in the candidate pool ranked too low; **22 never
+entered the 50-candidate pool at all**. Ranking is now largely solved —
+Issue 3 (retrieval recall) is the binding constraint for further gains.
 
 ---
 

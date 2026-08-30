@@ -186,6 +186,19 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
             rescored.append((item, WEIGHT_RETRIEVAL_SCORE * item["score"] + bonus))
         ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
 
+    # Demote (don't drop) anything already shown in a previous turn's
+    # top-10: if it was scored and the session continued, it is provably
+    # not the target, so a fresh candidate is strictly a better use of the
+    # slot. Demotion rather than exclusion keeps the list at a full 10 even
+    # once the pool is exhausted — a stable-sort partition, so relative
+    # order inside each group is preserved.
+    shown: set[str] = getattr(state, "shown_asins", set()) or set()
+    if shown:
+        ordered = (
+            [item for item in ordered if item["parent_asin"] not in shown]
+            + [item for item in ordered if item["parent_asin"] in shown]
+        )
+
     seen: set[str] = set()
     result: list[str] = []
     for item in ordered:

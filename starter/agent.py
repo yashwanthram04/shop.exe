@@ -58,6 +58,13 @@ class Agent:
         # for the full cross-team contract this satisfies.
         extract_slots(state, user_message)
 
+        # An override resets the scoring gate: the evaluator refuses to
+        # count any hit until the override message arrives, so products
+        # shown before now were never actually scored and must become
+        # eligible again (see SessionState.clear_shown).
+        if state.override_detected:
+            state.clear_shown()
+
         track = classify_track(state)
         # state.durable_notes (slot summary + this turn's raw text) is what
         # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
@@ -83,11 +90,18 @@ class Agent:
             "prompt_tokens": state.turn_usage["prompt_tokens"] + rank_usage["prompt_tokens"],
             "completion_tokens": state.turn_usage["completion_tokens"] + rank_usage["completion_tokens"],
         }
-        message = (
-            f"Do you have a {ask_attribute} preference?"
-            if ask_attribute
-            else "Here are some options based on what you've told me so far."
-        )
+        state.record_shown(ranked_ids)
+
+        if ask_attribute == "other":
+            # "other" is an API enum value, not an English word — asking
+            # "Do you have a other preference?" reads as broken in any
+            # transcript a judge reads, even though the simulator never
+            # parses `message`.
+            message = "Is there anything else that matters to you?"
+        elif ask_attribute:
+            message = f"Do you have a {ask_attribute} preference?"
+        else:
+            message = "Here are some options based on what you've told me so far."
         return {
             "message": message,
             "ask_attribute": ask_attribute,

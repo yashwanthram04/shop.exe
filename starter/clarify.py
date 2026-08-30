@@ -112,15 +112,19 @@ def diversity_score(candidate_pool: Sequence[Any], category: str) -> tuple[float
 
 def pool_is_too_broad(candidate_pool: Sequence[Any], turn: int, top_k: int) -> bool:
     """
-    True if the pool is still large/uncertain enough that clarification
-    is worth the turn cost. False means: pool is already tight, or we're
-    out of turn budget — go straight to recommending.
+    True if the pool is still large/uncertain enough that a *targeted*
+    (entropy-selected) clarification is worth making. False means the pool
+    is already tight — prefer the broad "other" probe over a narrow one.
+
+    NOTE: this no longer gates whether we ask *at all* (see
+    pick_attribute_to_ask). Asking is free — a response carries
+    `ask_attribute` AND `recommendations` together, and MTTC only counts
+    the turn the target is hit — so there is never a reason to stay
+    silent. `HARD_STOP_ASK_TURN` is deliberately not consulted here any
+    more for the same reason: it used to force `None` on turns 8-10,
+    guaranteeing three dead turns in every long session.
     """
-    if turn >= HARD_STOP_ASK_TURN:
-        return False
-    if len(candidate_pool) <= max(CONFIDENCE_POOL_THRESHOLD, top_k):
-        return False
-    return True
+    return len(candidate_pool) > max(CONFIDENCE_POOL_THRESHOLD, top_k)
 
 
 def pick_attribute_to_ask(
@@ -135,11 +139,23 @@ def pick_attribute_to_ask(
 
     Order of checks mirrors PRD §3.11 Rules A–D:
       A. a no-preference / boundary signal just fired this turn -> don't ask
-      B. no unfilled categories remain -> forced recommend-only
-      C. pool already small/confident, or turn budget exhausted -> skip
+      B. no unfilled categories remain -> fall back to the broad "other" probe
+      C. pool already tight -> skip the *targeted* ask, still probe "other"
       D. otherwise: pick the unfilled attribute with the highest
          (entropy, subject to a minimum coverage) — i.e. the attribute
          that would most split the current pool if we knew the answer.
+
+    Returning None is now reserved for Rule A alone. Measured on the 200
+    public sessions (ISSUES.md #8): *every* missed session used to end in a
+    trailing run of `None`, averaging 4.7 dead turns, because once the
+    entropy-eligible attributes were exhausted there was nothing left to
+    return. The evaluator answers `None` with "Those options are not quite
+    right yet. Ask me about one specific attribute." — strictly zero
+    information — while `"other"` matches ANY still-undisclosed fact
+    (evaluator/local_evaluator.py:178-181 short-circuits the class check
+    for it), so it is never worse and often better. Asking also costs
+    nothing: `ask_attribute` and `recommendations` ship in the same
+    response, and MTTC only counts the hit turn.
     """
     # `state` is the real SessionState object (state.py), not a dict — these
     # were originally written against an assumed dict-like contract (see the
@@ -165,20 +181,32 @@ def pick_attribute_to_ask(
         if filled_slots.get(cat) is None and cat not in filled_null
     ]
 
-    # Rule B
+    # Rule B — every named attribute is filled or explicitly nulled, but
+    # undisclosed facts may still exist that no named attribute maps onto
+    # (the evaluator's fact pool is not partitioned by our 9 categories).
+    # "other" is the only probe that can still reach them.
     if not unfilled:
-        return None
+        return "other"
 
-    # Rule C
+    # Rule C — pool is already tight, so a targeted entropy ask has little
+    # left to split. Still probe broadly rather than going silent.
     if not pool_is_too_broad(candidate_pool, turn, top_k):
-        return None
+        return "other"
 
     # Rule D0 — "other" bootstrap. Per AGENTS.md, asking "other" matches
     # ANY undisclosed hidden fact regardless of type (up to 2 per ask,
     # ~4 facts total), unlike a named attribute which only matches facts
-    # of that one type — the highest-yield probe available, previously
-    # never used (see ISSUES.md #2). Spend it early, twice, before
-    # pool-based entropy has much retrieved-candidate data to reason over.
+    # of that one type — the highest-yield probe available (ISSUES.md #2).
+    # Spend it early, before pool-based entropy has much retrieved-candidate
+    # data to reason over.
+    #
+    # The old `other_asked_count < 2` cap was a proxy for "~4 facts / 2 per
+    # ask", but it broke whenever an ask never got answered — in
+    # intent_override sessions the scripted override message *replaces* the
+    # reply to that turn's question, silently burning one of the two
+    # allowed probes (traced on public_0002). The bootstrap is still capped
+    # so entropy gets a turn, but exhausting it no longer dead-ends the
+    # session: "other" remains available as the Rule-D fallback below.
     if turn <= 2 and state.other_asked_count < 2:
         return "other"
 
@@ -198,15 +226,14 @@ def pick_attribute_to_ask(
         scored.append((cat, entropy))
 
     if not scored:
-        # Nothing clears the bar for a targeted ask. Previously this
-        # returned None here, which the evaluator answers with a fully
-        # information-free "ask me about one specific attribute" reply
-        # (ISSUES.md #2) — "other" can still surface real facts even when
-        # the pool doesn't clearly favor one attribute, so prefer it over
-        # asking nothing while it's still available.
-        if state.other_asked_count < 2:
-            return "other"
-        return None
+        # Nothing clears the entropy/coverage bar for a targeted ask —
+        # which is the common case late in a session, and is guaranteed for
+        # size/budget/feature/use_case because retrieval.py's
+        # _extract_attrs never populates them (ISSUES.md #6), so their
+        # coverage is always 0.0. Fall back to the broad probe instead of
+        # going silent; this is the specific line that used to start the
+        # trailing all-None run in every missed session.
+        return "other"
 
     best_category, _ = max(scored, key=lambda pair: pair[1])
     asked_categories.add(best_category)  # mutate in place; state is shared

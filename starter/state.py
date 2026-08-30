@@ -46,6 +46,7 @@ class SessionState:
         self.debug_log: list[dict] = []  # one entry per turn, for local debugging only
         self.turn_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         self.other_asked_count: int = 0  # see record_ask()
+        self.shown_asins: set[str] = set()  # see record_shown() / clear_shown()
 
     def advance_turn(self, turn: int) -> None:
         """Call once at the start of each `respond()` call, before anything
@@ -117,6 +118,33 @@ class SessionState:
             self.asked_categories.add(attribute)
             if attribute == "other":
                 self.other_asked_count += 1
+
+    def record_shown(self, asins: list[str]) -> None:
+        """Remember which products we've already put in front of the
+        customer.
+
+        If a product was in a scored top-10 and the session did NOT end,
+        that product is provably not the target — the evaluator ends the
+        session the instant the target appears (see AGENTS.md). Showing it
+        again spends a slot that can never pay off, so `rank()` demotes
+        anything in this set. Across a 10-turn session this widens total
+        coverage from the same 10 products to up to 100 distinct ones.
+        """
+        self.shown_asins.update(asins)
+
+    def clear_shown(self) -> None:
+        """Forget the shown-history. Called when an intent override is
+        detected.
+
+        This is NOT optional bookkeeping: in an intent_override session the
+        evaluator refuses to score any hit until the override message
+        arrives (`override_applied` gates the check). A product shown
+        before that point may well BE the target and simply didn't count —
+        measured on the public set, two such targets sat at pool positions
+        1 and 2. Without this reset, `record_shown` would permanently
+        exclude the correct answer and guarantee a miss.
+        """
+        self.shown_asins.clear()
 
     def decayed_slots(self, current_turn: int) -> dict[str, tuple[str, float]]:
         """Slot values with a confidence weight that shrinks the older they
