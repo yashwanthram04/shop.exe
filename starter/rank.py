@@ -46,7 +46,9 @@ almost never match even when the underlying products genuinely fit.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 
 from .state import SessionState
@@ -55,6 +57,21 @@ WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14 for the sweep that picked thi
 WEIGHT_SLOT_FIT = 0.4
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
+
+# Narrow LLM role #3 (ISSUES.md #16). Reuses router.py's Groq setup (same
+# OpenAI-SDK-compatible endpoint) rather than importing from it, to keep
+# rank.py's only cross-team dependency on state.py.
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_TIMEOUT_SECONDS = 6
+LLM_RERANK_POOL = 25  # shortlist size handed to the LLM -- keeps the prompt small/cheap
+LLM_RERANK_SYSTEM_PROMPT = (
+    "You rank shopping products for one customer, combining their CURRENT "
+    "stated preferences with their LONG-TERM shopping profile (past rating "
+    "behavior, purchase frequency, general preference tags). Reply with "
+    "ONLY a JSON array of the given product IDs, reordered best-match-first. "
+    "Include every ID exactly once. No other text."
+)
 
 # Attributes worth boosting at rank time by matching against product text.
 # category/material/color/size are exact-keyword-ish and matched by
@@ -143,6 +160,106 @@ def _slot_fit_bonus(product: dict, decayed_slots: dict[str, tuple[str, float]]) 
     return bonus
 
 
+def _profile_summary(user_profile: dict) -> str:
+    """Flatten the anonymized long-term profile from reset() into one
+    line. Every field here is accepted into SessionState.__init__ but was,
+    until this function existed, never read anywhere else in the codebase
+    — a real gap against the brief's "long-term user profiles" /
+    Personalized Context Distillation pillar (ISSUES.md #16)."""
+    if not user_profile:
+        return "no purchase history available"
+    parts = []
+    if user_profile.get("purchase_frequency"):
+        parts.append(f"purchase frequency: {user_profile['purchase_frequency']}")
+    if user_profile.get("average_prior_rating") is not None:
+        parts.append(f"average rating given: {user_profile['average_prior_rating']}")
+    if user_profile.get("rating_style"):
+        parts.append(f"rating style: {user_profile['rating_style']}")
+    if user_profile.get("preference_tags"):
+        parts.append(f"general preferences: {', '.join(user_profile['preference_tags'])}")
+    return "; ".join(parts) if parts else "no purchase history available"
+
+
+def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | None) -> list[dict]:
+    """Narrow LLM role #3 (ISSUES.md #16): re-rank the already
+    formula-sorted shortlist using BOTH current-turn slots AND the
+    long-term user_profile — distinct from the two roles already measured
+    negative (extraction, Issue 9; query-text rewriting, Issue 15). This
+    one only reorders a shortlist the formula ranker already produced,
+    using richer context (the profile) than the formula alone has access
+    to, rather than replacing any existing signal.
+
+    Retested here on the CURRENT pipeline, not reused from an old verdict:
+    the original LLM-rerank measurement (+0.003, noise) was taken against
+    the pre-fix 0.434-era pipeline — a completely different candidate pool
+    and ranking formula. Re-measuring before trusting that old result is
+    the same discipline that flipped Issue 9's verdict after the fusion
+    fix landed; reusing a stale measurement here would have been the exact
+    mistake ISSUES.md exists to catch.
+
+    Falls back to `ordered` unchanged on ANY failure — no opt-in, no key,
+    network error, timeout, malformed/hallucinated response. Must never
+    make the result WORSE than the formula alone, only optionally better.
+    """
+    if os.environ.get("USE_LLM_RERANK", "").strip().lower() not in ("1", "true", "yes"):
+        return ordered
+    if not os.environ.get("GROQ_API_KEY"):
+        return ordered
+    pool = ordered[:LLM_RERANK_POOL]
+    if len(pool) < 2:
+        return ordered
+    try:
+        from openai import OpenAI
+
+        listing_lines = []
+        for item in pool:
+            product = index.products.get(item["parent_asin"], {}) if index else {}
+            title = str(product.get("title", ""))[:80]
+            price = product.get("price")
+            rating = product.get("average_rating")
+            listing_lines.append(
+                f"{item['parent_asin']}: {title} | price={price} | rating={rating} | attrs={item.get('attrs', {})}"
+            )
+
+        client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL, timeout=GROQ_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0,
+            reasoning_effort="low",
+            messages=[
+                {"role": "system", "content": LLM_RERANK_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Current stated preferences: {state.summary()}\n"
+                        f"Long-term profile: {_profile_summary(state.user_profile)}\n\n"
+                        f"Candidates:\n" + "\n".join(listing_lines)
+                    ),
+                },
+            ],
+        )
+
+        if usage is not None and response.usage:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + response.usage.prompt_tokens
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) + response.usage.completion_tokens
+
+        content = (response.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            content = content.split("\n", 1)[-1] if "\n" in content else content
+        llm_order = json.loads(content)
+        if not isinstance(llm_order, list):
+            return ordered
+
+        by_asin = {item["parent_asin"]: item for item in pool}
+        reordered = [by_asin[asin] for asin in llm_order if isinstance(asin, str) and asin in by_asin]
+        seen_asins = {item["parent_asin"] for item in reordered}
+        reordered.extend(item for item in pool if item["parent_asin"] not in seen_asins)
+        return reordered + ordered[LLM_RERANK_POOL:]
+    except Exception:
+        return ordered
+
+
 def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | None = None) -> list[str]:
     """Order candidates best-to-worst and return up to 10 unique parent_asin.
 
@@ -216,6 +333,9 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
             [item for item in ordered if item["parent_asin"] not in shown]
             + [item for item in ordered if item["parent_asin"] in shown]
         )
+
+    if index is not None:
+        ordered = llm_rerank(ordered, state, index, usage)
 
     seen: set[str] = set()
     result: list[str] = []

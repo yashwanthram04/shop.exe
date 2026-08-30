@@ -28,6 +28,7 @@ variable fraction of calls, making those runs non-reproducible.
 | + Issue 14 (normalize retrieval score, W=0.15) | **0.8451** |
 
 | + Issue 15 (LLM query synthesis, USE_LLM_QUERY_SYNTHESIS) | 0.8401 (regression, kept opt-in) |
+| + Issue 16 (LLM reranking, USE_LLM_RERANK) | 0.7845 (significant regression, kept opt-in) |
 
 Remaining open: 5 misses (`public_0020/0083/0095/0096/0126`), all in Buying/
 Intent Override/Browsing. Issue 6 (attrs coverage) is deliberately NOT
@@ -551,6 +552,58 @@ listing, so this exact failure mode wouldn't apply to genuine freeform
 input. Documented and left available behind its own flag rather than
 deleted, since it's a legitimate technique that this specific test
 harness happens to penalize.
+
+---
+
+## Issue 16 — LLM reranking re-tested on the current pipeline: a significant regression 🔴 CRITICAL FINDING
+
+**Status:** ✅ measured cleanly, kept opt-in (`USE_LLM_RERANK`) and off by
+default. **0.8451 → 0.7845 (−0.06)**, hit rate unchanged (97.5%, same
+count, slightly different sessions) but **MRR collapsed 0.6286 → 0.4249**.
+
+This retests a role already tried once, on the old pre-fix 0.434 pipeline,
+where it measured as noise-level (+0.003). Reusing that stale verdict
+would have been exactly the mistake this file exists to prevent — Issue
+9's LLM-extraction verdict flipped from "regression" to "neutral" after
+the fusion fix landed, so every LLM role needed re-checking on the current
+pipeline before trusting old data. This one was worth building properly
+this time: it reranks the formula's own top 25 using BOTH current-turn
+slots AND the long-term `user_profile` (`preference_tags`/`rating_style`/
+`purchase_frequency`) — the first place in the codebase that profile is
+actually read, closing a real Pillar III gap in addition to being an
+LLM-ranking-stage experiment.
+
+**First attempt was invalid — a real methodological trap worth recording.**
+The first full run came back bit-identical to the no-rerank baseline
+(same score to 4 decimals) with anomalously low token usage. Traced to
+Groq's free-tier daily cap (200K tokens) being exhausted by cumulative
+testing earlier the same day — every rerank call was silently hitting
+`RateLimitError`, caught by the by-design safety fallback (`except
+Exception: return ordered`), so the pipeline ran unchanged and looked
+"neutral" for entirely the wrong reason. Upgraded to Groq's paid tier and
+re-ran clean (1,118,681 tokens, zero rate-limit errors) before trusting
+any number — a bit-identical result should have been the tell.
+
+**Why it fails, following directly from Issue 14/15's finding:** this
+evaluator's disclosed facts are verbatim excerpts from the target's own
+catalog listing, and the formula ranker (normalized retrieval score +
+rating + popularity + exact/token-overlap slot-fit) is already tuned to
+exploit that. An LLM judging "does this look like a good match" from a
+title/attrs/price summary reasons more generically — a plausible-but-wrong
+candidate reads just as reasonable to it as the one with genuine verbatim
+overlap, so it reorders away from precision the formula could already
+see, even though it usually keeps *a* plausible product in the top 10
+(hence hit rate barely moving while MRR collapses).
+
+**Not a reason to distrust the technique in general** — same caveat as
+Issue 15: this is a property of a synthetic customer whose "correct
+answer" is defined by exact text reuse, which most real recommendation
+contexts don't guarantee. Worth citing in the writeup as the strongest,
+most rigorously-measured evidence in this project for *why* the default
+configuration is fully deterministic: two independent LLM ranking-stage
+attempts, one retested on request specifically to avoid a stale verdict,
+both net-negative for the same underlying reason once actually measured
+cleanly.
 
 ---
 
