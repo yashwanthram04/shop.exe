@@ -20,7 +20,7 @@ load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ,
 from .clarify import pick_attribute_to_ask
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
-from .router import classify_track, extract_slots
+from .router import classify_track, extract_slots, synthesize_search_query
 from .state import SessionState
 
 EMPTY_RESPONSE = {
@@ -64,6 +64,15 @@ class Agent:
         # eligible again (see SessionState.clear_shown).
         if state.override_detected:
             state.clear_shown()
+
+        # Opt-in (USE_LLM_QUERY_SYNTHESIS), narrow LLM role #2: rewrite the
+        # mechanical slot-concatenation query into one fluent sentence
+        # closer to real catalog text (ISSUES.md #15). Overwrites
+        # durable_notes only on success; any failure/opt-out keeps the
+        # existing deterministic query untouched.
+        synthesized = synthesize_search_query(state, state.turn_usage)
+        if synthesized:
+            state.durable_notes = synthesized
 
         track = classify_track(state)
         # state.durable_notes (slot summary + this turn's raw text) is what

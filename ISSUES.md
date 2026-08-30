@@ -27,9 +27,11 @@ variable fraction of calls, making those runs non-reproducible.
 | + Issue 13 (widen pool 50→250) | 0.8322 (hit rate 99%, MRR collapsed) |
 | + Issue 14 (normalize retrieval score, W=0.15) | **0.8451** |
 
+| + Issue 15 (LLM query synthesis, USE_LLM_QUERY_SYNTHESIS) | 0.8401 (regression, kept opt-in) |
+
 Remaining open: 5 misses (`public_0020/0083/0095/0096/0126`), all in Buying/
-Intent Override. Issue 6 (attrs coverage) is deliberately NOT being fixed;
-see Issue 8.
+Intent Override/Browsing. Issue 6 (attrs coverage) is deliberately NOT
+being fixed; see Issue 8.
 
 ---
 
@@ -507,6 +509,48 @@ whenever an override is detected.
 **6** had the target in the candidate pool ranked too low; **22 never
 entered the 50-candidate pool at all**. Ranking is now largely solved —
 Issue 3 (retrieval recall) is the binding constraint for further gains.
+
+---
+
+## Issue 15 — LLM query synthesis: the right idea, still a net negative 🟡 MEDIUM
+
+**Status:** ✅ measured, kept opt-in (`USE_LLM_QUERY_SYNTHESIS`) and off by
+default. 0.8451 → 0.8401 (−0.005), same 5 misses persist, MRR 0.6286 →
+0.611, cost 13,067 tokens for the 200-session run.
+
+This was a deliberately different, narrower LLM role than Issue 9's
+extraction (which failed for a different reason — over-normalizing
+customer text away from what the hard filter needs verbatim). Here the
+LLM's only job is to rewrite the mechanical slot concatenation
+(`"category: accessories belts, material: leather; leather, feature:
+Imported; Buckle closure."`) into one fluent sentence closer to real
+catalog prose, for `semantic_candidates()` to embed. Verified the output
+is genuinely good in isolation — e.g. `"Imported leather belt with a
+buckle closure, perfect for stylish everyday wear."` — faithful to the
+known facts, well-formed, exactly the kind of text embedding models are
+trained on.
+
+**It still lost, and both LLM failures share one root cause.** This
+evaluator's customer discloses facts as **verbatim excerpts from the
+target product's own catalog text** (confirmed earlier:
+`intent_card()` builds every disclosed constraint directly from
+`product["features"]`/`product["details"]`). The mechanical concatenation
+therefore already contains exact substrings of the answer's real listing —
+free, guaranteed lexical overlap for BM25 and a strong anchor for
+embedding similarity. Any LLM rewrite, however fluent or well-scoped,
+necessarily paraphrases those exact tokens away in exchange for
+readability a human would want but the matching mechanism doesn't need.
+Extraction (Issue 9) lost by normalizing facts before storage; synthesis
+here loses by paraphrasing them at query time — different stage, same
+underlying tension between "sounds natural" and "matches verbatim."
+
+**Not a reason to rule out LLM assistance in general** — it's a
+property of *this* evaluator's synthetic-customer design, not of LLMs.
+Real user queries are never guaranteed verbatim substrings of the answer's
+listing, so this exact failure mode wouldn't apply to genuine freeform
+input. Documented and left available behind its own flag rather than
+deleted, since it's a legitimate technique that this specific test
+harness happens to penalize.
 
 ---
 

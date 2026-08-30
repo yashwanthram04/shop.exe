@@ -219,6 +219,66 @@ def _classify_unprompted_llm(message: str, usage: dict | None) -> dict[str, str]
         return None
 
 
+QUERY_SYNTHESIS_SYSTEM_PROMPT = (
+    "You write ONE short search-engine query sentence for a shopping "
+    "catalog, given a customer's known preferences. Write it in the style "
+    "of an actual product listing (e.g. 'Leather men's belt with a buckle "
+    "closure, casual everyday wear'), NOT as a list of key:value pairs and "
+    "NOT as a question. Use ONLY the preferences given — never invent a "
+    "material, color, brand, or use case that wasn't stated. 12-25 words. "
+    "Reply with ONLY the sentence, no quotes, no other text."
+)
+
+
+def synthesize_search_query(state: SessionState, usage: dict | None) -> str | None:
+    """Narrow, specialized LLM role #2 (see ISSUES.md #15): NOT extraction
+    (Issue 9 measured that as a net negative — it over-normalizes and drops
+    signal) and NOT reranking (measured as noise, see rank.py's module
+    docstring). This is query rewriting: turn the mechanical slot
+    concatenation `durable_notes` currently is
+    ("category: women dresses, material: polyester, feature: Imported;
+    Wrap closure.") into one fluent sentence that reads like actual catalog
+    text, for `semantic_candidates()` to embed. The failure mode that made
+    extraction lose (normalizing/rewriting text) is exactly what this job
+    wants — a fluent rewritten query is the intended output here, not a
+    side effect to avoid.
+
+    Returns None on ANY failure (no opt-in, no key, network error, empty
+    reply) so the caller keeps the existing mechanical `durable_notes` —
+    this must never make retrieval WORSE than the deterministic baseline,
+    only optionally better.
+    """
+    if os.environ.get("USE_LLM_QUERY_SYNTHESIS", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    if not os.environ.get("GROQ_API_KEY"):
+        return None
+    if not state.filled_slots:
+        return None  # nothing known yet to write a query about
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL, timeout=GROQ_TIMEOUT_SECONDS)
+        preferences = ", ".join(f"{attribute}: {value}" for attribute, value in state.filled_slots.items())
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0.2,  # a little variation is fine/desirable for phrasing; facts are still constrained by the prompt
+            reasoning_effort="low",
+            messages=[
+                {"role": "system", "content": QUERY_SYNTHESIS_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Known preferences: {preferences}"},
+            ],
+        )
+
+        if usage is not None and response.usage:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + response.usage.prompt_tokens
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) + response.usage.completion_tokens
+
+        content = (response.choices[0].message.content or "").strip().strip('"')
+        return content or None
+    except Exception:
+        return None
+
+
 def _understand_unprompted(message: str, usage: dict | None) -> dict[str, str]:
     """Entry point for freeform text: real LLM understanding when a Groq
     key is available, the regex/keyword fallback otherwise. Same shape
