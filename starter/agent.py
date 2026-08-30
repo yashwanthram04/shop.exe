@@ -69,7 +69,15 @@ class Agent:
         # state.durable_notes (slot summary + this turn's raw text) is what
         # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
         # hookup, now built once in state.py rather than duplicated here.
-        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
+        #
+        # top_n=50 -> 250 (ISSUES.md #13): once clarification is exhausted,
+        # durable_notes stops changing turn-to-turn (Issue 12 correctly
+        # removed the boilerplate text that used to perturb it), so the
+        # candidate pool becomes fixed for the rest of the session. Measured
+        # keyword ranks of the 11 remaining misses' targets: 63, 98, 112,
+        # 118, 137, 138, 185, 200, 370, 376, 444 — a pool of 50 structurally
+        # cannot ever contain 9 of these 11, no matter how many turns pass.
+        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=250)
 
         # pick_attribute_to_ask now owns the "should I even ask" gate
         # internally (Rule C, formerly the standalone pool_is_too_broad

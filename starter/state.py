@@ -177,7 +177,7 @@ class SessionState:
             return ""
         return ", ".join(f"{attribute}: {value}" for attribute, value in self.filled_slots.items())
 
-    def update_durable_notes(self, message: str) -> None:
+    def update_durable_notes(self, message: str, include_message: bool = True) -> None:
         """Refresh `durable_notes` — the free-text query material handed to
         Person A's `semantic_candidates()`. Combines the structured slot
         summary (so confirmed facts are always represented) with the
@@ -196,8 +196,27 @@ class SessionState:
         back on). `summary()` now returns "" when empty, so an unfilled
         turn's query is just the customer's own words, not "no preferences
         stated yet. I'm looking for earrings, but I'm still exploring."
+
+        `include_message=False` (see router.py's `is_no_signal_reply`)
+        drops the raw message too, for the mirror-image case: a reply that
+        carries no signal of its OWN (e.g. "I don't have an additional
+        preference for other.") should not dilute the query either. Found
+        on ALL 12 sessions still missing at 94% hit rate — every one of
+        them ended with exactly this kind of sentence embedded verbatim
+        into the search query (ISSUES.md #12).
         """
         summary = self.summary()
+        if not include_message:
+            # Defensive: a no-signal reply this early (no filled slots yet)
+            # would otherwise blank the query entirely, and retrieval.py's
+            # keyword/semantic routes both return nothing for an empty
+            # string — keep the previous turn's notes rather than search on
+            # nothing. Not expected to trigger in practice (a no-signal
+            # reply only occurs after we've already asked something, by
+            # which point category is almost always filled), but cheap
+            # insurance against a hidden-catalog edge case doing the same.
+            self.durable_notes = summary.strip() or self.durable_notes
+            return
         self.durable_notes = f"{summary}. {message}".strip() if summary else message.strip()
 
     def log_turn(self, turn: int, track: str, candidate_count: int, ask_attribute: str | None) -> None:

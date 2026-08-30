@@ -70,7 +70,46 @@ USE_CASE_WORDS = ("hiking", "running", "gym", "winter", "outdoor", "work")
 BOUNDARY_PHRASES = ("no preference", "whatever", "doesn't matter", "don't care", "any is fine", "up to you", "your judgment")
 OVERRIDE_PHRASES = ("actually", "instead", "forget", "change my mind", "no longer", "ignore my earlier", "on second thought")
 
-BUDGET_RE = re.compile(r"\$?\s?(\d+(?:\.\d+)?)")
+# A number only counts as a budget when it sits next to an actual price
+# cue — either a currency symbol, or a budget word within a few characters.
+#
+# The previous pattern was r"\$?\s?(\d+(?:\.\d+)?)": it made the "$" optional
+# and was run over the WHOLE message, so it returned the first number
+# anywhere in the text. Traced on public_0051, whose reply contains both
+# "Go Walk 5-True" and "budget around $56.95": it extracted budget="5" for a
+# $56.95 product, and filter_candidates() then hard-excluded that target —
+# a guaranteed miss on an item ranked #1 by BOTH keyword and semantic
+# retrieval (ISSUES.md #11).
+#
+# Deliberately no minimum-value sanity floor: anchoring alone fixes the
+# defect, and a floor would wrongly reject genuinely cheap items (socks,
+# accessories) that legitimately exist in this catalog.
+#
+# The non-"$" cue list is deliberately short and money-specific.
+# evaluator/local_evaluator.py's own intent_card() always writes budget
+# disclosures as f"budget around ${price}" — "$" is present in every
+# genuine budget statement THIS evaluator ever generates, so the fallback
+# cues below exist purely for freeform/private-set robustness, not public-
+# set recall. An earlier, broader cue list (including "up to"/"around"/
+# "about"/"max") caused a regression on public_0042: "...fits up to 8-inch
+# wrist circumference" is a wrist-size measurement, and "up to" + a number
+# is far more common as a physical-measurement phrase than a price phrase
+# in a clothing/jewelry catalog. Keep only cues that are near-exclusively
+# monetary.
+BUDGET_RE = re.compile(
+    r"\$\s?(\d+(?:\.\d+)?)"
+    r"|\b(?:under|below|budget|less\s+than|cheaper\s+than)\b"
+    r"[^0-9]{0,12}?(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _extract_budget(text: str) -> str | None:
+    """First price-cue-anchored number in `text`, or None. See BUDGET_RE."""
+    match = BUDGET_RE.search(text)
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
 # Every scenario's opening line starts "I'm looking for {category}" (see
 # AGENTS.md / initial_message in the evaluator) — this is a near-free,
 # always-available extraction, not gated behind any other heuristic.
@@ -87,6 +126,12 @@ BRAND_RE = re.compile(r"\bby ([A-Z][\w'&-]*(?:\s+[A-Z][\w'&-]*){0,2})\b")
 # keyword classification needed, just trust the attribution.
 ANSWER_TEMPLATE_RE = re.compile(r"^for that,\s*what matters is:\s*(.+?)\.?\s*$", re.IGNORECASE)
 NO_MORE_TEMPLATE_RE = re.compile(r"^i don't have an additional preference for \w+\.?\s*$", re.IGNORECASE)
+# customer_reply()'s reply when ask_attribute was None (see
+# evaluator/local_evaluator.py:171) — carries zero product signal.
+NULL_ASK_NUDGE_RE = re.compile(
+    r"^those options are not quite right yet\.?\s*ask me about one specific attribute\.?\s*$",
+    re.IGNORECASE,
+)
 # The evaluator's fixed override template: "Actually, ignore my earlier
 # preference. What I need is: {new_value}."
 OVERRIDE_VALUE_RE = re.compile(r"what i need is:?\s*(.+?)\.?\s*$", re.IGNORECASE)
@@ -203,10 +248,9 @@ def _classify_unprompted(message: str) -> dict[str, str]:
         if category:
             slots["category"] = category.lower()
 
-    if "$" in text or "under" in text or "budget" in text:
-        match = BUDGET_RE.search(text)
-        if match:
-            slots["budget"] = match.group(1)
+    budget = _extract_budget(text)
+    if budget is not None:
+        slots["budget"] = budget
 
     material = _first_match(text, MATERIAL_WORDS)
     if material:
@@ -247,10 +291,9 @@ def classify_single(text: str) -> tuple[str, str] | None:
     is safe.
     """
     lowered = text.lower()
-    if "$" in lowered or "under" in lowered or "budget" in lowered:
-        match = BUDGET_RE.search(lowered)
-        if match:
-            return "budget", match.group(1)
+    budget = _extract_budget(lowered)
+    if budget is not None:
+        return "budget", budget
     material = _first_match(lowered, MATERIAL_WORDS)
     if material:
         return "material", material
@@ -311,17 +354,15 @@ def extract_slot_values(message: str, last_asked: str | None = None, usage: dict
             values = [v.strip() for v in answer_match.group(1).split(";") if v.strip()]
             if values:
                 if last_asked == "other":
-                    result: dict[str, str] = {}
+                    grouped: dict[str, list[str]] = {}
                     for value in values:
                         classified = classify_single(value)
                         if classified is None:
                             continue
                         attribute, classified_value = classified
-                        result[attribute] = (
-                            f"{result[attribute]}; {classified_value}" if attribute in result else classified_value
-                        )
-                    return result
-                return {last_asked: "; ".join(values)}
+                        grouped.setdefault(attribute, []).append(classified_value)
+                    return {attribute: _dedupe_join(vals) for attribute, vals in grouped.items()}
+                return {last_asked: _dedupe_join(values)}
         if NO_MORE_TEMPLATE_RE.match(stripped):
             return {}
 
@@ -332,6 +373,47 @@ def detect_boundary(message: str) -> bool:
     """True if the message reads like 'I have no preference for that'."""
     text = message.lower()
     return any(phrase in text for phrase in BOUNDARY_PHRASES)
+
+
+def _dedupe_join(values: list[str]) -> str:
+    """Join with "; ", preserving order but dropping exact repeats.
+
+    Found live on 4 of the 12 misses diagnosed while chasing 100% hit rate:
+    slots like material='cotton; cotton; cotton' or 'polyester; polyester'
+    (ISSUES.md #12). A single "other" reply can disclose two distinct
+    product-fact strings that both happen to classify to the same
+    attribute+value (e.g. two different feature sentences both mentioning
+    "polyester") — case classify_single() can't tell apart, but joining
+    them verbatim wastes query length on a repeated word with zero added
+    signal, right when every character of the embedded query matters most.
+    """
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(value.strip())
+    return "; ".join(deduped)
+
+
+def is_no_signal_reply(message: str) -> bool:
+    """True for the three reply shapes that carry zero product information
+    (ISSUES.md #12): the evaluator's "no additional preference" template,
+    its "not quite right yet" null-ask nudge, and a boundary "no
+    preference" reply. All three were previously folded verbatim into
+    `durable_notes` — the query text `semantic_candidates()` embeds — on
+    every one of the 12 misses diagnosed while chasing 100% hit rate.
+    Diluting cosine similarity with a sentence about the ABSENCE of a
+    preference, on exactly the turns where no new signal arrived, was
+    actively hurting the one thing that still needs the most help.
+    """
+    stripped = message.strip()
+    return bool(
+        NO_MORE_TEMPLATE_RE.match(stripped)
+        or NULL_ASK_NUDGE_RE.match(stripped)
+        or detect_boundary(message)
+    )
 
 
 def detect_override_signal(message: str) -> bool:
@@ -413,7 +495,7 @@ def extract_slots(state: SessionState, message: str) -> SessionState:
     """
     if state.last_asked and detect_boundary(message):
         state.close_attribute(state.last_asked)
-        state.update_durable_notes(message)
+        state.update_durable_notes(message, include_message=False)
         return state
 
     state.override_detected = detect_override_signal(message)
@@ -448,7 +530,7 @@ def extract_slots(state: SessionState, message: str) -> SessionState:
             source = "asked" if attribute == state.last_asked or state.last_asked == "other" else "freeform"
             state.set_slot(attribute, value, state.turn, source=source)
 
-    state.update_durable_notes(message)
+    state.update_durable_notes(message, include_message=not is_no_signal_reply(message))
     return state
 
 

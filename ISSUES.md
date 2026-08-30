@@ -22,9 +22,134 @@ default (see Issue 9). Earlier numbers in this file that were taken with
 Groq enabled are not directly comparable — Groq was silently failing on a
 variable fraction of calls, making those runs non-reproducible.
 
-Remaining open: Issue 3 (retrieval ceiling) — now the dominant limit, see
-Issue 10's measurement. Issue 6 (attrs coverage) is deliberately NOT being
-fixed; see Issue 8.
+| + Issue 11 (budget regex anchoring) | 0.8439 |
+| + Issue 12 (query pollution removal) alone | 0.8273 (regression, see Issue 13) |
+| + Issue 13 (widen pool 50→250) | 0.8322 (hit rate 99%, MRR collapsed) |
+| + Issue 14 (normalize retrieval score, W=0.15) | **0.8451** |
+
+Remaining open: 5 misses (`public_0020/0083/0095/0096/0126`), all in Buying/
+Intent Override. Issue 6 (attrs coverage) is deliberately NOT being fixed;
+see Issue 8.
+
+---
+
+## Issue 11 — Budget regex grabs the first number in the message, not the price 🔴 CRITICAL
+
+**Status:** ✅ fixed. 0.8400 → **0.8439** (94% → 94.5% hit rate), zero regressions.
+
+Found by diagnosing all 12 remaining misses (keyword rank / semantic rank /
+filter survival, replayed through the real `Agent`). `public_0051`'s target
+ranked **#1 on both keyword and semantic retrieval** — a guaranteed hit by
+recall — yet still missed.
+
+**Root cause:** the old `BUDGET_RE = r"\$?\s?(\d+(?:\.\d+)?)"` made `$`
+optional and was run over the whole message, returning the first number
+anywhere in the text. The reply contained both `"Go Walk 5-True"` and
+`"budget around $56.95"`; it extracted `budget="5"` for a product that
+costs $56.95, and `filter_candidates()` silently excluded the correctly-
+ranked target on a hard constraint that was never really stated.
+
+**Fix:** require the number to sit next to an actual price cue (`$`, or a
+short money-specific word list) rather than matching anywhere in the
+message. Applied at both call sites (`_classify_unprompted` and
+`classify_single`) via a shared `_extract_budget()` helper.
+
+**One self-caught regression during this fix, worth recording:** an
+initial version added generic cues (`up to`, `around`, `about`, `max`) to
+widen recall for freeform phrasing — this broke `public_0042` by matching
+*"fits up to 8-inch wrist circumference"* (a wrist measurement) as a
+budget of `8`. Confirmed via `evaluator/local_evaluator.py`'s own
+`intent_card()` that every genuine budget disclosure this evaluator
+generates always includes `$` — the non-`$` cue list only needs to cover
+freeform/private-set robustness, not public-set recall, so it was narrowed
+to `under/below/budget/less than/cheaper than` only. Both the original bug
+and this self-inflicted regression are now covered by regression tests in
+the fix's own verification (6 cases, all passing).
+
+---
+
+## Issue 12 — Zero-information replies embedded verbatim into the search query 🟠 HIGH
+
+**Status:** ✅ fixed, but see Issue 13 — fixing this alone was a regression
+(0.8439 → 0.8273) that exposed a bigger, previously-masked problem.
+
+All 12 remaining misses at 94.5% hit rate ended their session with a
+sentence like *"I don't have an additional preference for other."*
+embedded directly into `durable_notes` — the text `semantic_candidates()`
+embeds. Three reply shapes carry zero product signal:
+`NO_MORE_TEMPLATE_RE`, the boundary reply, and the null-ask nudge
+(*"Those options are not quite right yet..."*, previously undetected —
+no regex existed for it at all).
+
+**Fix:** `router.is_no_signal_reply()` detects all three; `state.
+update_durable_notes(message, include_message=False)` keeps the slot
+summary but drops the noise sentence, with a defensive fallback to the
+previous turn's notes if that would empty the query entirely. Also fixed
+duplicate-value pollution in the same pass: a single `"other"` reply
+disclosing two distinct facts that both classify to the same attribute
+(e.g. two feature sentences both mentioning "polyester") produced
+`material: 'polyester; polyester'` — added `_dedupe_join()`.
+
+**The regression this caused, and why it's actually informative:** once
+clarification exhausts, `durable_notes` now correctly stops changing
+turn-to-turn — but that also means the retrieval pool becomes genuinely
+*fixed* for the rest of the session. Before this fix, the boilerplate
+reply text varied slightly by attribute name (*"...for brand"* vs
+*"...for other"*), which accidentally perturbed the query enough to
+occasionally shuffle a hidden target into an otherwise-static top-50 by
+luck. Removing that noise (correctly — it was never real signal) exposed
+that the pool itself was too small. Directly motivated Issue 13.
+
+---
+
+## Issue 13 — Candidate pool too small for where targets actually rank 🔴 CRITICAL
+
+**Status:** ✅ fixed (paired with Issue 14). 0.8273 → 0.8322 alone (hit
+rate 99%, MRR collapsed) → **0.8451** once Issue 14 rebalanced ranking.
+
+Diagnosed by instrumenting `keyword_candidates`/`semantic_candidates`
+directly against the real per-session query for all remaining misses.
+Every target was genuinely findable, but final-turn keyword ranks were
+63, 98, 112, 118, 137, 138, 185, 200, 370, 376, 444 — `top_n=50`
+structurally cannot contain 9 of these 11, regardless of how many turns
+the conversation runs.
+
+**Fix:** raised `top_n` 50 → 250 in `agent.py`'s call to `retrieve()`.
+Alone, this took hit rate 94.5% → **99%** (2 misses) — Boundary/Browsing/
+Intent Override all reached 100%. But MRR collapsed 0.6867 → 0.5413 (46 of
+198 hits landed at rank 6-10), for a net-negative score change — see
+Issue 14 for why and the fix that recovered it.
+
+---
+
+## Issue 14 — Retrieval relevance was nearly inert in final ranking 🔴 CRITICAL
+
+**Status:** ✅ fixed. 0.8322 → **0.8451**, hit rate 99% → 97.5% (small,
+deliberate trade for a much larger MRR gain), full breakdown:
+Boundary 100% / Browsing 98.75% / Buying 96.25% / Intent Override 96.67%.
+
+**Root cause, found by comparing scales directly:** `rank()` combines
+`WEIGHT_RETRIEVAL_SCORE(1.0) * item["score"] + rating_bonus +
+popularity_bonus + slot_fit_bonus`. Raw RRF scores (`weight / (RRF_K +
+rank)`, RRF_K=60) only span **~0.003–0.013** — two orders of magnitude
+below the bonus terms' combined **0–0.65** range. Final order was decided
+almost entirely by generic rating/popularity/slot-fit, not by how well a
+candidate actually matched the query. Invisible at `top_n=50` (few
+"good-enough" lookalikes exist in a small pool to exploit this), it became
+the dominant effect at `top_n=250` (Issue 13): plausible-but-wrong products
+with a good rating or one shared material were routinely outscoring the
+actual target on relevance to the *specific* query.
+
+**Fix:** min-max normalize the retrieval score to [0, 1] within each
+turn's pool before blending with the bonus terms, so retrieval relevance
+and the bonuses are on comparable scales. Full normalization
+(`WEIGHT_RETRIEVAL_SCORE=1.0`) overcorrected — hit rate dropped to 96.5%
+because now-dominant retrieval position crowded out targets that were only
+findable via bonus terms (MRR 0.6024, score 0.8245, still net-negative).
+Swept `WEIGHT_RETRIEVAL_SCORE ∈ {0.15, 0.3, 0.5}` post-normalization —
+**0.15 won outright** (score 0.8451, hit 97.5%) over both 0.3 (0.8379) and
+0.5 (0.8352), and over no normalization at all (0.8322). Retrieval
+relevance needed real influence, not total dominance.
 
 Reference numbers from a 40-session instrumented replay (Groq disabled, so
 these are independent of any LLM behaviour):

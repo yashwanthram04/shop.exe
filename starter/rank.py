@@ -51,7 +51,7 @@ import re
 
 from .state import SessionState
 
-WEIGHT_RETRIEVAL_SCORE = 1.0
+WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14 for the sweep that picked this value
 WEIGHT_SLOT_FIT = 0.4
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
@@ -173,17 +173,35 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
     if index is None:
         ordered = sorted(candidates, key=lambda item: -item["score"])
     else:
+        # Min-max normalize retrieval score to [0, 1] within this turn's
+        # pool before blending with the bonuses (ISSUES.md #14). Raw RRF
+        # scores (retrieval.py's `weight / (RRF_K + rank)`, RRF_K=60) only
+        # span ~0.003-0.013 — two orders of magnitude below the bonus terms'
+        # 0-0.65 range — so WEIGHT_RETRIEVAL_SCORE=1.0 was nearly inert:
+        # final order was decided almost entirely by rating/popularity/
+        # slot-fit, not by how well a candidate actually matched the query.
+        # Invisible at top_n=50 (a small pool has few "similar enough"
+        # lookalikes competing on generic bonuses), it became the dominant
+        # effect once top_n grew to 250 (Issue 13): 46 of 198 hits landed at
+        # rank 6-10, because plausible-but-wrong products with a good rating
+        # or a shared material were routinely outscoring the actual target
+        # on relevance to the specific query.
+        raw_scores = [item["score"] for item in candidates]
+        lo, hi = min(raw_scores), max(raw_scores)
+        spread = hi - lo
+
         current_turn = getattr(state, "turn", 0)
         decayed = state.decayed_slots(current_turn)
         rescored: list[tuple[dict, float]] = []
         for item in candidates:
+            normalized_score = (item["score"] - lo) / spread if spread > 0 else 1.0
             product = index.products.get(item["parent_asin"])
             bonus = 0.0
             if product:
                 bonus += WEIGHT_RATING * _normalized_rating(product.get("average_rating"))
                 bonus += WEIGHT_POPULARITY * _normalized_popularity(product.get("rating_number"))
                 bonus += WEIGHT_SLOT_FIT * _slot_fit_bonus(product, decayed)
-            rescored.append((item, WEIGHT_RETRIEVAL_SCORE * item["score"] + bonus))
+            rescored.append((item, WEIGHT_RETRIEVAL_SCORE * normalized_score + bonus))
         ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
 
     # Demote (don't drop) anything already shown in a previous turn's
