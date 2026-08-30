@@ -53,7 +53,7 @@ import re
 
 from .state import SessionState
 
-WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14 for the sweep that picked this value
+WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14/#19 for the sweeps that picked this value
 WEIGHT_SLOT_FIT = 0.4
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10

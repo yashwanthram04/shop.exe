@@ -86,7 +86,7 @@ class Agent:
         # keyword ranks of the 11 remaining misses' targets: 63, 98, 112,
         # 118, 137, 138, 185, 200, 370, 376, 444 — a pool of 50 structurally
         # cannot ever contain 9 of these 11, no matter how many turns pass.
-        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=250)
+        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=600)
 
         # pick_attribute_to_ask now owns the "should I even ask" gate
         # internally (Rule C, formerly the standalone pool_is_too_broad
