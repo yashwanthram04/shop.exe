@@ -11,29 +11,36 @@ not estimates. Where a run used a subset, the sample size is stated.
 | + hybrid retrieval/filters/embeddings (pre-diagnosis) | 0.4342 |
 | + Issue 1 (RRF fusion) | 0.6084 |
 | + Issue 2 ("other" probe) | 0.7891 |
-| + Issue 5 (confirmed neutral, LLM extraction kept on) | 0.7903 |
+| + Issue 5 (LLM extraction, measured neutral at the time — see Issue 18) | 0.7903 |
 | + Issue 7 (override merge fix) | **0.7964** |
 | + chaithra/retrieval-fixes branch (query pollution, override guard, RRF weights) | 0.8041 |
 | + Issue 8 (never return `None`) | 0.8193 |
 | + Issue 10 (stop re-recommending disproven products) | **0.8400** |
 
-All scores above are measured with LLM extraction OFF, which is now the
-default (see Issue 9). Earlier numbers in this file that were taken with
-Groq enabled are not directly comparable — Groq was silently failing on a
-variable fraction of calls, making those runs non-reproducible.
+All scores above are measured with LLM extraction OFF, which is the
+default throughout this project (see Issue 9/18). Earlier numbers in this
+file taken with Groq enabled are not directly comparable to each other —
+one run was invalid due to silent rate-limit fallbacks (Issue 16), and
+extraction's own verdict changed materially between the 0.789 and 0.845
+pipelines (Issue 18) — always compare an LLM-on number only against an
+LLM-off run of the *same* commit, never across pipeline versions.
 
 | + Issue 11 (budget regex anchoring) | 0.8439 |
 | + Issue 12 (query pollution removal) alone | 0.8273 (regression, see Issue 13) |
 | + Issue 13 (widen pool 50→250) | 0.8322 (hit rate 99%, MRR collapsed) |
-| + Issue 14 (normalize retrieval score, W=0.15) | **0.8451** |
+| + Issue 14 (normalize retrieval score, W=0.15) | **0.8451 (current default)** |
 
 | + Issue 15 (LLM query synthesis, USE_LLM_QUERY_SYNTHESIS) | 0.8401 (regression, kept opt-in) |
 | + Issue 16 (LLM reranking, USE_LLM_RERANK) | 0.7845 (significant regression, kept opt-in) |
 | + Issue 17 (verbatim-overlap-aware rerank prompt, same flag) | 0.8107 (confirms diagnosis, still net negative) |
+| + Issue 18 (Issue 9 retested on current pipeline: LLM extraction) | 0.798, 18 misses (severe regression, confirms opt-in default) |
 
-Remaining open: 5 misses (`public_0020/0083/0095/0096/0126`), all in Buying/
-Intent Override/Browsing. Issue 6 (attrs coverage) is deliberately NOT
-being fixed; see Issue 8.
+**Every LLM role now measured on the current pipeline is a confirmed
+regression** (Issues 15/16/17/18) — see Issue 18 for why combining them
+was not attempted despite being asked. Remaining open: 5 misses
+(`public_0020/0083/0095/0096/0126`), all in Buying/Intent Override/
+Browsing. Issue 6 (attrs coverage) is deliberately NOT being fixed; see
+Issue 8.
 
 ---
 
@@ -448,11 +455,14 @@ Verified directly: trailing-`None` runs went from 35/35 missed sessions to
 
 ---
 
-## Issue 9 — LLM slot extraction is not worth its cost 🟡 MEDIUM
+## Issue 9 — LLM slot extraction is not worth its cost 🔴 CRITICAL
 
-**Status:** ✅ resolved — now opt-in via `USE_LLM_EXTRACTION`, off by default.
+**Status:** ✅ opt-in via `USE_LLM_EXTRACTION`, off by default — **verdict
+corrected below (Issue 18), this section's original measurement is stale.**
 
-Measured on identical code, only Groq toggled:
+Measured on identical code, only Groq toggled (numbers below are from the
+0.789-era pipeline — before Issues 11-14 landed; see Issue 18 for the
+current, much worse number):
 
 | | LLM off | LLM on |
 |---|---|---|
@@ -481,6 +491,54 @@ calls (5,421 tokens where ~46,000 were expected), so it was mostly
 measuring the regex path. Any `except: return None` fallback around a
 network call makes runs non-deterministic; compare only against explicit
 LLM-off runs.
+
+---
+
+## Issue 18 — Issue 9's verdict was stale: extraction is now a severe regression 🔴 CRITICAL
+
+**Status:** ✅ retested on the current pipeline, confirmed opt-in and off
+by default (no code change needed — already gated). **0.8451 → 0.798**,
+hit rate **97.5% → 91%** (5 misses → **18 misses**), Browsing **98.75% →
+82.5%**.
+
+Prompted by the same question already asked of reranking (Issue 16) and
+answered the same way: don't trust an old LLM verdict after the pipeline
+changes underneath it. Issue 9's "neutral" reading was measured on the
+0.789-era pipeline, before the budget-regex fix, query-pollution removal,
+pool widening (50→250), and ranking-score normalization (Issues 11-14) —
+four changes later, extraction was never re-checked. It should have been;
+the current pipeline depends on verbatim text matching far more heavily
+than the old one did (a bigger pool surfaces more lookalikes that only the
+formula's exact-substring/token-overlap bonuses can correctly discount),
+so extraction's normalization now damages far more than before — not just
+the LLM's own reasoning, but the **deterministic formula's own**
+`_slot_fit_bonus` and `filter_candidates`, which do plain string matching
+against whatever text ends up in `filled_slots`.
+
+**Combined with Issues 15-17, this closes out the question of combining
+all LLM roles together** (asked directly): every individually-measured
+role is now a confirmed regression on the current pipeline, and each one
+fails via the same mechanism (paraphrasing away from the verbatim match
+the evaluator secretly rewards) at a different pipeline stage. Stacking
+them would compound the same failure serially — extraction's paraphrased
+slots would feed query synthesis's already-paraphrased rewrite, then feed
+a reranker judging an already-degraded pool — rather than average out
+across independent failure modes. Not run as a combined experiment: the
+mechanism is now confirmed four separate times, on the current pipeline,
+and running the combination would very likely just confirm the same
+prediction at a worse number and further Groq cost, not add new
+information.
+
+**Standing conclusion across Issues 9/15/16/17/18, worth stating plainly
+for the writeup:** this specific evaluator's synthetic customer discloses
+facts as verbatim excerpts from the target's own catalog listing. Every
+LLM role tested — extraction, query rewriting, reranking (both blind and
+explicitly told about the mechanism) — loses precisely because an LLM's
+core strength (fluent, generalized understanding) is the opposite of what
+this particular scoring mechanism rewards (exact text reuse). This is a
+property of the test harness, not a general verdict on LLM usefulness,
+and the default configuration (fully deterministic, 0.8451, works with
+zero API keys) reflects that finding rather than working around it.
 
 ---
 
