@@ -401,6 +401,26 @@ def extract_slots(state: SessionState, message: str) -> SessionState:
         return state
 
     state.override_detected = detect_override_signal(message)
+    # BUGFIX (found by adversarial testing, not in ISSUES.md): a disclosed
+    # constraint can coincidentally contain an OVERRIDE_PHRASES substring
+    # (e.g. a product feature mentioning "forget" or "instead") — without
+    # this guard, detect_override_signal() would fire on a completely
+    # normal trusted-template answer and misroute it into apply_override(),
+    # which uses lossy single-value classification and can wipe an
+    # unrelated slot via clear_freeform_override(), instead of the correct
+    # multi-value trusted extraction extract_slot_values() already handles
+    # for this exact message shape. The boundary check above already gets
+    # this kind of priority over general text heuristics; override
+    # detection didn't, and needed the same guard. Confirmed reachable
+    # (not just theoretical): 1/200 public-set intent cards already
+    # contains such a collision (public_0168, "forget" in a disclosed
+    # bracelet-feature constraint) — it happened not to matter there only
+    # because that session hit on turn 1, before the colliding text was
+    # ever disclosed via a customer reply.
+    if state.last_asked:
+        stripped = message.strip()
+        if ANSWER_TEMPLATE_RE.match(stripped) or NO_MORE_TEMPLATE_RE.match(stripped):
+            state.override_detected = False
     if not (state.override_detected and apply_override(state, message, state.turn)):
         extracted = extract_slot_values(message, last_asked=state.last_asked, usage=state.turn_usage)
         for attribute, value in extracted.items():

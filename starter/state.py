@@ -141,9 +141,12 @@ class SessionState:
         """Short human-readable recap, rebuilt fresh each turn (not
         accumulated text) so prompt/token cost stays flat across turns.
         Feeds `message` composition and `update_durable_notes` below.
+
+        Returns "" (not a filler sentence) when nothing is filled yet —
+        see `update_durable_notes` for why that matters.
         """
         if not self.filled_slots:
-            return "no preferences stated yet"
+            return ""
         return ", ".join(f"{attribute}: {value}" for attribute, value in self.filled_slots.items())
 
     def update_durable_notes(self, message: str) -> None:
@@ -153,8 +156,21 @@ class SessionState:
         current turn's raw message (so freeform nuance not captured by any
         slot still reaches semantic search). Rebuilt fresh each turn, not
         accumulated indefinitely, so token/embedding cost stays flat.
+
+        BUGFIX (found live): this used to always prefix the literal string
+        "no preferences stated yet" whenever no slots were filled — which
+        is exactly turn 1 of every Browsing/Boundary session (45% of the
+        whole public set) and the first turn or two of everything else.
+        That phrase carries no product signal and gets embedded right next
+        to the actual message, diluting cosine similarity against every
+        real product description on precisely the turns where semantic
+        retrieval matters most (Browsing has no hard-filter signal to fall
+        back on). `summary()` now returns "" when empty, so an unfilled
+        turn's query is just the customer's own words, not "no preferences
+        stated yet. I'm looking for earrings, but I'm still exploring."
         """
-        self.durable_notes = f"{self.summary()}. {message}".strip()
+        summary = self.summary()
+        self.durable_notes = f"{summary}. {message}".strip() if summary else message.strip()
 
     def log_turn(self, turn: int, track: str, candidate_count: int, ask_attribute: str | None) -> None:
         """Lightweight per-turn trace for debugging against the 200 dev
