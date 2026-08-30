@@ -13,7 +13,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .clarify import pick_attribute_to_ask, pool_is_too_broad
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ, if present
+
+from .clarify import pick_attribute_to_ask
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
 from .router import classify_track, extract_slots
@@ -40,14 +44,14 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         try:
-            return self._respond(state, user_message, turn)
+            return self._respond(state, user_message, turn, top_k)
         except Exception:
             # A crash counts as a miss for this session regardless (see
             # AGENTS.md) — fail safe with a valid empty response instead of
             # raising, so one bad turn doesn't corrupt the whole run.
             return dict(EMPTY_RESPONSE)
 
-    def _respond(self, state: SessionState, user_message: str, turn: int) -> dict:
+    def _respond(self, state: SessionState, user_message: str, turn: int, top_k: int) -> dict:
         state.advance_turn(turn)
         # One call folds boundary/override/slot-extraction into state, and
         # refreshes state.durable_notes — see router.py's module docstring
@@ -56,17 +60,29 @@ class Agent:
 
         track = classify_track(state)
         # state.durable_notes (slot summary + this turn's raw text) is what
-        # Person A's semantic_candidates() should embed — the AGENTS.md
-        # -flagged state->retrieval hookup.
+        # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
+        # hookup, now built once in state.py rather than duplicated here.
         candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
 
-        ask_attribute = None
-        if pool_is_too_broad(len(candidates), track, turn):
-            ask_attribute = pick_attribute_to_ask(state)
+        # pick_attribute_to_ask now owns the "should I even ask" gate
+        # internally (Rule C, formerly the standalone pool_is_too_broad
+        # call here) as well as which attribute to ask about (Rule D) and
+        # the boundary-just-fired skip (Rule A, auto-detected from state).
+        ask_attribute = pick_attribute_to_ask(candidates, state, top_k)
         state.record_ask(ask_attribute)
         state.log_turn(turn, track, len(candidates), ask_attribute)
 
-        ranked_ids = rank(candidates, state)
+        # index=self.index opts into rating/popularity/slot-fit scoring
+        # (see the note at the bottom of rank.py). rank.py's own `usage`
+        # stays {0, 0} — it makes no LLM call — but router.py's extraction
+        # (state.turn_usage) does whenever GROQ_API_KEY is set, so both are
+        # merged into the one number this turn actually costs.
+        rank_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        ranked_ids = rank(candidates, state, index=self.index, usage=rank_usage)
+        usage = {
+            "prompt_tokens": state.turn_usage["prompt_tokens"] + rank_usage["prompt_tokens"],
+            "completion_tokens": state.turn_usage["completion_tokens"] + rank_usage["completion_tokens"],
+        }
         message = (
             f"Do you have a {ask_attribute} preference?"
             if ask_attribute
@@ -76,5 +92,5 @@ class Agent:
             "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": [{"parent_asin": asin} for asin in ranked_ids],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": usage,
         }
