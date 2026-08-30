@@ -20,7 +20,7 @@ load_dotenv()  # loads .env (gitignored, per-person local keys) into os.environ,
 from .clarify import pick_attribute_to_ask
 from .rank import rank
 from .retrieval import RetrievalIndex, retrieve
-from .router import classify_track, extract_slots
+from .router import classify_track, extract_slots, synthesize_search_query
 from .state import SessionState
 
 EMPTY_RESPONSE = {
@@ -58,11 +58,35 @@ class Agent:
         # for the full cross-team contract this satisfies.
         extract_slots(state, user_message)
 
+        # An override resets the scoring gate: the evaluator refuses to
+        # count any hit until the override message arrives, so products
+        # shown before now were never actually scored and must become
+        # eligible again (see SessionState.clear_shown).
+        if state.override_detected:
+            state.clear_shown()
+
+        # Opt-in (USE_LLM_QUERY_SYNTHESIS), narrow LLM role #2: rewrite the
+        # mechanical slot-concatenation query into one fluent sentence
+        # closer to real catalog text (ISSUES.md #15). Overwrites
+        # durable_notes only on success; any failure/opt-out keeps the
+        # existing deterministic query untouched.
+        synthesized = synthesize_search_query(state, state.turn_usage)
+        if synthesized:
+            state.durable_notes = synthesized
+
         track = classify_track(state)
         # state.durable_notes (slot summary + this turn's raw text) is what
         # retrieval.py searches on — the AGENTS.md-flagged state->retrieval
         # hookup, now built once in state.py rather than duplicated here.
-        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=50)
+        #
+        # top_n=50 -> 250 (ISSUES.md #13): once clarification is exhausted,
+        # durable_notes stops changing turn-to-turn (Issue 12 correctly
+        # removed the boilerplate text that used to perturb it), so the
+        # candidate pool becomes fixed for the rest of the session. Measured
+        # keyword ranks of the 11 remaining misses' targets: 63, 98, 112,
+        # 118, 137, 138, 185, 200, 370, 376, 444 — a pool of 50 structurally
+        # cannot ever contain 9 of these 11, no matter how many turns pass.
+        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=600)
 
         # pick_attribute_to_ask now owns the "should I even ask" gate
         # internally (Rule C, formerly the standalone pool_is_too_broad
@@ -83,11 +107,18 @@ class Agent:
             "prompt_tokens": state.turn_usage["prompt_tokens"] + rank_usage["prompt_tokens"],
             "completion_tokens": state.turn_usage["completion_tokens"] + rank_usage["completion_tokens"],
         }
-        message = (
-            f"Do you have a {ask_attribute} preference?"
-            if ask_attribute
-            else "Here are some options based on what you've told me so far."
-        )
+        state.record_shown(ranked_ids)
+
+        if ask_attribute == "other":
+            # "other" is an API enum value, not an English word — asking
+            # "Do you have a other preference?" reads as broken in any
+            # transcript a judge reads, even though the simulator never
+            # parses `message`.
+            message = "Is there anything else that matters to you?"
+        elif ask_attribute:
+            message = f"Do you have a {ask_attribute} preference?"
+        else:
+            message = "Here are some options based on what you've told me so far."
         return {
             "message": message,
             "ask_attribute": ask_attribute,

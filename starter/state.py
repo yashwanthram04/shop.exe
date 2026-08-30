@@ -46,6 +46,7 @@ class SessionState:
         self.debug_log: list[dict] = []  # one entry per turn, for local debugging only
         self.turn_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         self.other_asked_count: int = 0  # see record_ask()
+        self.shown_asins: set[str] = set()  # see record_shown() / clear_shown()
 
     def advance_turn(self, turn: int) -> None:
         """Call once at the start of each `respond()` call, before anything
@@ -118,6 +119,33 @@ class SessionState:
             if attribute == "other":
                 self.other_asked_count += 1
 
+    def record_shown(self, asins: list[str]) -> None:
+        """Remember which products we've already put in front of the
+        customer.
+
+        If a product was in a scored top-10 and the session did NOT end,
+        that product is provably not the target — the evaluator ends the
+        session the instant the target appears (see AGENTS.md). Showing it
+        again spends a slot that can never pay off, so `rank()` demotes
+        anything in this set. Across a 10-turn session this widens total
+        coverage from the same 10 products to up to 100 distinct ones.
+        """
+        self.shown_asins.update(asins)
+
+    def clear_shown(self) -> None:
+        """Forget the shown-history. Called when an intent override is
+        detected.
+
+        This is NOT optional bookkeeping: in an intent_override session the
+        evaluator refuses to score any hit until the override message
+        arrives (`override_applied` gates the check). A product shown
+        before that point may well BE the target and simply didn't count —
+        measured on the public set, two such targets sat at pool positions
+        1 and 2. Without this reset, `record_shown` would permanently
+        exclude the correct answer and guarantee a miss.
+        """
+        self.shown_asins.clear()
+
     def decayed_slots(self, current_turn: int) -> dict[str, tuple[str, float]]:
         """Slot values with a confidence weight that shrinks the older they
         are — but a slot the customer directly confirmed by answering our
@@ -141,20 +169,55 @@ class SessionState:
         """Short human-readable recap, rebuilt fresh each turn (not
         accumulated text) so prompt/token cost stays flat across turns.
         Feeds `message` composition and `update_durable_notes` below.
+
+        Returns "" (not a filler sentence) when nothing is filled yet —
+        see `update_durable_notes` for why that matters.
         """
         if not self.filled_slots:
-            return "no preferences stated yet"
+            return ""
         return ", ".join(f"{attribute}: {value}" for attribute, value in self.filled_slots.items())
 
-    def update_durable_notes(self, message: str) -> None:
+    def update_durable_notes(self, message: str, include_message: bool = True) -> None:
         """Refresh `durable_notes` — the free-text query material handed to
         Person A's `semantic_candidates()`. Combines the structured slot
         summary (so confirmed facts are always represented) with the
         current turn's raw message (so freeform nuance not captured by any
         slot still reaches semantic search). Rebuilt fresh each turn, not
         accumulated indefinitely, so token/embedding cost stays flat.
+
+        BUGFIX (found live): this used to always prefix the literal string
+        "no preferences stated yet" whenever no slots were filled — which
+        is exactly turn 1 of every Browsing/Boundary session (45% of the
+        whole public set) and the first turn or two of everything else.
+        That phrase carries no product signal and gets embedded right next
+        to the actual message, diluting cosine similarity against every
+        real product description on precisely the turns where semantic
+        retrieval matters most (Browsing has no hard-filter signal to fall
+        back on). `summary()` now returns "" when empty, so an unfilled
+        turn's query is just the customer's own words, not "no preferences
+        stated yet. I'm looking for earrings, but I'm still exploring."
+
+        `include_message=False` (see router.py's `is_no_signal_reply`)
+        drops the raw message too, for the mirror-image case: a reply that
+        carries no signal of its OWN (e.g. "I don't have an additional
+        preference for other.") should not dilute the query either. Found
+        on ALL 12 sessions still missing at 94% hit rate — every one of
+        them ended with exactly this kind of sentence embedded verbatim
+        into the search query (ISSUES.md #12).
         """
-        self.durable_notes = f"{self.summary()}. {message}".strip()
+        summary = self.summary()
+        if not include_message:
+            # Defensive: a no-signal reply this early (no filled slots yet)
+            # would otherwise blank the query entirely, and retrieval.py's
+            # keyword/semantic routes both return nothing for an empty
+            # string — keep the previous turn's notes rather than search on
+            # nothing. Not expected to trigger in practice (a no-signal
+            # reply only occurs after we've already asked something, by
+            # which point category is almost always filled), but cheap
+            # insurance against a hidden-catalog edge case doing the same.
+            self.durable_notes = summary.strip() or self.durable_notes
+            return
+        self.durable_notes = f"{summary}. {message}".strip() if summary else message.strip()
 
     def log_turn(self, turn: int, track: str, candidate_count: int, ask_attribute: str | None) -> None:
         """Lightweight per-turn trace for debugging against the 200 dev

@@ -412,7 +412,7 @@ def retrieve(
     keyword_hits = index.keyword_candidates(query, top_n)  # list[(asin, score)], best-first
     semantic_hits = index.semantic_candidates(query, top_n)  # list[(asin, score)], best-first
 
-    keyword_weight, semantic_weight = (0.7, 0.3) if track == "buying" else (0.3, 0.7)
+    keyword_weight, semantic_weight = (0.8, 0.2) if track == "buying" else (0.4, 0.6)
     merged: dict[str, float] = {}
     for rank, (asin, _score) in enumerate(keyword_hits):
         merged[asin] = merged.get(asin, 0.0) + keyword_weight / (RRF_K + rank)

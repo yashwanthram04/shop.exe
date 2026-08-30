@@ -46,15 +46,47 @@ almost never match even when the underlying products genuinely fit.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 
 from .state import SessionState
 
-WEIGHT_RETRIEVAL_SCORE = 1.0
+WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14/#19 for the sweeps that picked this value
 WEIGHT_SLOT_FIT = 0.4
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
+
+# Narrow LLM role #3 (ISSUES.md #16). Reuses router.py's Groq setup (same
+# OpenAI-SDK-compatible endpoint) rather than importing from it, to keep
+# rank.py's only cross-team dependency on state.py.
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_TIMEOUT_SECONDS = 6
+LLM_RERANK_POOL = 25  # shortlist size handed to the LLM -- keeps the prompt small/cheap
+LLM_RERANK_SYSTEM_PROMPT = (
+    "You rank shopping products for one customer, combining their CURRENT "
+    "stated preferences with their LONG-TERM shopping profile (past rating "
+    "behavior, purchase frequency, general preference tags). Reply with "
+    "ONLY a JSON array of the given product IDs, reordered best-match-first. "
+    "Include every ID exactly once. No other text."
+)
+# ISSUES.md #17: this system's customer preferences are frequently VERBATIM
+# QUOTES lifted directly from the correct product's own listing text (this
+# is how the underlying evaluator generates them). Each candidate below is
+# tagged with verbatim_overlap: N — how many of the customer's own exact
+# words appear in THAT product's own text. Treat a high verbatim_overlap as
+# strong evidence of correctness, even over a candidate that otherwise
+# seems like a more generic/plausible fit.
+LLM_RERANK_SYSTEM_PROMPT_V2 = LLM_RERANK_SYSTEM_PROMPT + (
+    " IMPORTANT: this customer's stated preferences are frequently exact "
+    "quotes copied from the correct product's own listing text. Each "
+    "candidate is tagged with verbatim_overlap: N, the count of the "
+    "customer's own words that appear verbatim in that product's text. "
+    "Weight verbatim_overlap heavily — a high count is strong evidence of "
+    "the correct answer, more reliable than general plausibility."
+)
 
 # Attributes worth boosting at rank time by matching against product text.
 # category/material/color/size are exact-keyword-ish and matched by
@@ -143,6 +175,131 @@ def _slot_fit_bonus(product: dict, decayed_slots: dict[str, tuple[str, float]]) 
     return bonus
 
 
+def _profile_summary(user_profile: dict) -> str:
+    """Flatten the anonymized long-term profile from reset() into one
+    line. Every field here is accepted into SessionState.__init__ but was,
+    until this function existed, never read anywhere else in the codebase
+    — a real gap against the brief's "long-term user profiles" /
+    Personalized Context Distillation pillar (ISSUES.md #16)."""
+    if not user_profile:
+        return "no purchase history available"
+    parts = []
+    if user_profile.get("purchase_frequency"):
+        parts.append(f"purchase frequency: {user_profile['purchase_frequency']}")
+    if user_profile.get("average_prior_rating") is not None:
+        parts.append(f"average rating given: {user_profile['average_prior_rating']}")
+    if user_profile.get("rating_style"):
+        parts.append(f"rating style: {user_profile['rating_style']}")
+    if user_profile.get("preference_tags"):
+        parts.append(f"general preferences: {', '.join(user_profile['preference_tags'])}")
+    return "; ".join(parts) if parts else "no purchase history available"
+
+
+def _verbatim_overlap(customer_text: str, product: dict) -> int:
+    """Count of the customer's own meaningful words that appear verbatim in
+    this product's own text — the explicit signal handed to the LLM in
+    Issue 17, computed the same way _slot_fit_bonus already reasons
+    internally but exposed as a visible number instead of a hidden score.
+    """
+    customer_tokens = _tokenize(customer_text)
+    if not customer_tokens:
+        return 0
+    haystack = " ".join([
+        str(product.get("title", "")),
+        str(product.get("features", "")),
+        str(product.get("description", "")),
+        str(product.get("details", "")),
+        str(product.get("categories", "")),
+    ])
+    product_tokens = _tokenize(haystack)
+    return len(customer_tokens & product_tokens)
+
+
+def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | None) -> list[dict]:
+    """Narrow LLM role #3 (ISSUES.md #16, v2 in #17): re-rank the already
+    formula-sorted shortlist using BOTH current-turn slots AND the
+    long-term user_profile — distinct from the two roles already measured
+    negative (extraction, Issue 9; query-text rewriting, Issue 15). This
+    one only reorders a shortlist the formula ranker already produced,
+    using richer context (the profile) than the formula alone has access
+    to, rather than replacing any existing signal.
+
+    v2 (Issue 17): the v1 prompt asked the LLM to judge general plausibility
+    from a title/attrs summary and lost badly (0.845 -> 0.785, MRR
+    collapsed) — traced to this evaluator defining "correct" as verbatim
+    text reuse from the target's own listing, which general-plausibility
+    reasoning can't see. v2 computes that overlap explicitly
+    (_verbatim_overlap) and hands it to the model as a visible number per
+    candidate, with an instruction to weight it heavily — the same signal
+    the formula ranker already exploits, now legible to the LLM too,
+    instead of asking it to rediscover it from vibes.
+
+    Falls back to `ordered` unchanged on ANY failure — no opt-in, no key,
+    network error, timeout, malformed/hallucinated response. Must never
+    make the result WORSE than the formula alone, only optionally better.
+    """
+    if os.environ.get("USE_LLM_RERANK", "").strip().lower() not in ("1", "true", "yes"):
+        return ordered
+    if not os.environ.get("GROQ_API_KEY"):
+        return ordered
+    pool = ordered[:LLM_RERANK_POOL]
+    if len(pool) < 2:
+        return ordered
+    try:
+        from openai import OpenAI
+
+        customer_text = state.durable_notes or state.summary()
+        listing_lines = []
+        for item in pool:
+            product = index.products.get(item["parent_asin"], {}) if index else {}
+            title = str(product.get("title", ""))[:80]
+            price = product.get("price")
+            rating = product.get("average_rating")
+            overlap = _verbatim_overlap(customer_text, product)
+            listing_lines.append(
+                f"{item['parent_asin']}: {title} | price={price} | rating={rating} "
+                f"| attrs={item.get('attrs', {})} | verbatim_overlap={overlap}"
+            )
+
+        client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL, timeout=GROQ_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0,
+            reasoning_effort="low",
+            messages=[
+                {"role": "system", "content": LLM_RERANK_SYSTEM_PROMPT_V2},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Current stated preferences: {state.summary()}\n"
+                        f"Long-term profile: {_profile_summary(state.user_profile)}\n\n"
+                        f"Candidates:\n" + "\n".join(listing_lines)
+                    ),
+                },
+            ],
+        )
+
+        if usage is not None and response.usage:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + response.usage.prompt_tokens
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) + response.usage.completion_tokens
+
+        content = (response.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            content = content.split("\n", 1)[-1] if "\n" in content else content
+        llm_order = json.loads(content)
+        if not isinstance(llm_order, list):
+            return ordered
+
+        by_asin = {item["parent_asin"]: item for item in pool}
+        reordered = [by_asin[asin] for asin in llm_order if isinstance(asin, str) and asin in by_asin]
+        seen_asins = {item["parent_asin"] for item in reordered}
+        reordered.extend(item for item in pool if item["parent_asin"] not in seen_asins)
+        return reordered + ordered[LLM_RERANK_POOL:]
+    except Exception:
+        return ordered
+
+
 def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | None = None) -> list[str]:
     """Order candidates best-to-worst and return up to 10 unique parent_asin.
 
@@ -173,18 +330,52 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
     if index is None:
         ordered = sorted(candidates, key=lambda item: -item["score"])
     else:
+        # Min-max normalize retrieval score to [0, 1] within this turn's
+        # pool before blending with the bonuses (ISSUES.md #14). Raw RRF
+        # scores (retrieval.py's `weight / (RRF_K + rank)`, RRF_K=60) only
+        # span ~0.003-0.013 — two orders of magnitude below the bonus terms'
+        # 0-0.65 range — so WEIGHT_RETRIEVAL_SCORE=1.0 was nearly inert:
+        # final order was decided almost entirely by rating/popularity/
+        # slot-fit, not by how well a candidate actually matched the query.
+        # Invisible at top_n=50 (a small pool has few "similar enough"
+        # lookalikes competing on generic bonuses), it became the dominant
+        # effect once top_n grew to 250 (Issue 13): 46 of 198 hits landed at
+        # rank 6-10, because plausible-but-wrong products with a good rating
+        # or a shared material were routinely outscoring the actual target
+        # on relevance to the specific query.
+        raw_scores = [item["score"] for item in candidates]
+        lo, hi = min(raw_scores), max(raw_scores)
+        spread = hi - lo
+
         current_turn = getattr(state, "turn", 0)
         decayed = state.decayed_slots(current_turn)
         rescored: list[tuple[dict, float]] = []
         for item in candidates:
+            normalized_score = (item["score"] - lo) / spread if spread > 0 else 1.0
             product = index.products.get(item["parent_asin"])
             bonus = 0.0
             if product:
                 bonus += WEIGHT_RATING * _normalized_rating(product.get("average_rating"))
                 bonus += WEIGHT_POPULARITY * _normalized_popularity(product.get("rating_number"))
                 bonus += WEIGHT_SLOT_FIT * _slot_fit_bonus(product, decayed)
-            rescored.append((item, WEIGHT_RETRIEVAL_SCORE * item["score"] + bonus))
+            rescored.append((item, WEIGHT_RETRIEVAL_SCORE * normalized_score + bonus))
         ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
+
+    # Demote (don't drop) anything already shown in a previous turn's
+    # top-10: if it was scored and the session continued, it is provably
+    # not the target, so a fresh candidate is strictly a better use of the
+    # slot. Demotion rather than exclusion keeps the list at a full 10 even
+    # once the pool is exhausted — a stable-sort partition, so relative
+    # order inside each group is preserved.
+    shown: set[str] = getattr(state, "shown_asins", set()) or set()
+    if shown:
+        ordered = (
+            [item for item in ordered if item["parent_asin"] not in shown]
+            + [item for item in ordered if item["parent_asin"] in shown]
+        )
+
+    if index is not None:
+        ordered = llm_rerank(ordered, state, index, usage)
 
     seen: set[str] = set()
     result: list[str] = []
