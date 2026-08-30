@@ -153,8 +153,15 @@ class SessionState:
         current turn's raw message (so freeform nuance not captured by any
         slot still reaches semantic search). Rebuilt fresh each turn, not
         accumulated indefinitely, so token/embedding cost stays flat.
+
+        When no slots are filled yet, `summary()`'s "no preferences stated
+        yet" filler adds no retrieval signal and only dilutes the embedding
+        query — skip it and use the raw message alone (see ISSUES.md #3).
         """
-        self.durable_notes = f"{self.summary()}. {message}".strip()
+        if not self.filled_slots:
+            self.durable_notes = message.strip()
+        else:
+            self.durable_notes = f"{self.summary()}. {message}".strip()
 
     def log_turn(self, turn: int, track: str, candidate_count: int, ask_attribute: str | None) -> None:
         """Lightweight per-turn trace for debugging against the 200 dev

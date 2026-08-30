@@ -47,3 +47,19 @@ Use this file to record each local evaluator run. Keep one entry per run with th
 - Note: Fresh baseline run from python -m evaluator.local_evaluator. Browsing is the major weakness, buying is much stronger, boundary is zero, and the overall score matches the documented baseline reference for the starter agent.
 
 ---
+
+### Run 2026-08-31 (live keys, final confirmation) 
+- TechnicalScore: 0.809543
+- MRR: 0.65781
+- MTTC: 3.14
+- Efficiency: 0.786
+- Buying: 0.925
+- Browsing: 0.925
+- Intent Override: 0.8
+- Boundary: 1.0
+- Token usage: 12224 prompt + 2061 completion = 14285 total (200 sessions) 
+**Final state for this session: 0.809543 live / 0.816993 Groq-off**, up from the 0.10671 starting baseline and the 0.7964 mid-session documented baseline.
+
+---
+
+

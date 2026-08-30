@@ -162,9 +162,26 @@ def _understand_unprompted(message: str, usage: dict | None) -> dict[str, str]:
     """Entry point for freeform text: real LLM understanding when a Groq
     key is available, the regex/keyword fallback otherwise. Same shape
     either way — nothing downstream needs to know which path ran.
+
+    The LLM is instructed to ignore filler dialogue like "still exploring",
+    but Browsing/Boundary's opening line ("I'm looking for {category}, but
+    I'm still exploring.") is exactly that template — so a literal reading
+    makes it return {} for the whole message, discarding the category along
+    with the genuine filler. `CATEGORY_RE` is free and unconditionally
+    reliable for this template (see extract_slot_values' docstring), so it
+    always backfills `category` when the LLM didn't already surface one,
+    regardless of which path ran.
     """
     llm_result = _classify_unprompted_llm(message, usage)
-    return llm_result if llm_result is not None else _classify_unprompted(message)
+    if llm_result is None:
+        return _classify_unprompted(message)
+    if "category" not in llm_result:
+        category_match = CATEGORY_RE.search(message)
+        if category_match:
+            category = category_match.group(1).strip(" .,")
+            if category:
+                llm_result["category"] = category.lower()
+    return llm_result
 
 
 def _classify_unprompted(message: str) -> dict[str, str]:

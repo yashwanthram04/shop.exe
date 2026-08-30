@@ -45,12 +45,13 @@ STOPWORDS = {
 MATERIAL_WORDS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "denim")
 COLOR_WORDS = ("black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey", "purple", "yellow", "orange")
 STYLE_WORDS = ("casual", "formal", "athletic", "classic", "vintage", "modern", "sporty", "elegant")
+USE_CASE_WORDS = ("hiking", "running", "gym", "winter", "outdoor", "work")
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_TIMEOUT_SECONDS = 8  # keep a single turn from hanging if the API is slow/unreachable
 BUDGET_TOLERANCE = 1.15  # ~15% slack: intent text is often "budget around $X", not an exact cap
-RRF_K = 60  # standard Reciprocal Rank Fusion constant (see retrieve(), ISSUES.md #1)
+RRF_K = 30  # tuned against the 200-session dev set (see retrieve() docstring, ISSUES.md #1/#3)
 
 
 def _parse_budget(value: str | None) -> float | None:
@@ -190,7 +191,17 @@ class RetrievalIndex:
                 if not any(part.lower() in haystack for part in _split_slot_values(brand)):
                     continue
             if size:
-                haystack = (_text(product.get("details")) + " " + _text(product.get("features"))).lower()
+                # Many catalog entries have no "Size" key in `details` at
+                # all (see ISSUES.md #3) but do mention it in the title
+                # (e.g. "Large tote bag") — details/features-only missed
+                # those and could silently drop the target.
+                haystack = (
+                    _text(product.get("details"))
+                    + " "
+                    + _text(product.get("features"))
+                    + " "
+                    + _text(product.get("title"))
+                ).lower()
                 if not any(part.lower() in haystack for part in _split_slot_values(size)):
                     continue
             if category:
@@ -234,6 +245,15 @@ class RetrievalIndex:
         router.py's extract_slots, but deliberately kept independent here:
         one parses customer messages, this parses product text, and neither
         owner needs to import the other's file for what's a few word lists.
+
+        Covers 6 of 9 attributes (see ISSUES.md #6). `feature` is inherently
+        free-text and doesn't fit this single-value-per-attribute shape, so
+        it's left out deliberately. `budget` and `size` were also tried and
+        measured harmful (-0.003 TechnicalScore each, isolated tests):
+        `budget` even bucketed into $10 tiers is still fine-grained enough
+        to trivially maximize entropy and make clarify.py over-prefer
+        asking about it; `size`'s harm wasn't diagnosed further since
+        `use_case` alone was a clean net positive and budget/size were not.
         """
         haystack = f"{_text(product.get('title'))} {_text(product.get('features'))} {_text(product.get('details'))}".lower()
         attrs: dict[str, str] = {}
@@ -248,6 +268,10 @@ class RetrievalIndex:
         for word in STYLE_WORDS:
             if word in haystack:
                 attrs["style"] = word
+                break
+        for word in USE_CASE_WORDS:
+            if word in haystack:
+                attrs["use_case"] = word
                 break
         if product.get("store"):
             attrs["brand"] = str(product["store"])
@@ -405,14 +429,20 @@ def retrieve(
     reaching the top-10 from 45.0% to 72.5% of the 72.5% ever retrieved —
     i.e. it fixed essentially all of the ranking loss, not retrieval loss.
 
-    TODO (Person A): the 0.7/0.3 keyword/semantic weighting is still an
-    untuned first guess — now that both routes are on the same scale, it's
-    meaningful to tune it against the 200 dev sessions' scenario_metrics.
+    Weights and RRF_K tuned against the 200-session dev set (Groq off,
+    isolating one variable per run, per ISSUES.md's own methodology):
+    buying keyword/semantic moved 0.7/0.3 -> 0.9/0.1 (+0.002), browsing's
+    0.3/0.7 held as the local best across {0.1,0.2,0.3,0.4,0.5}/complements,
+    and RRF_K moved 60 -> 30 (the single biggest win of this pass, +0.012,
+    tested against {10,20,30,40,60}). Combined: TechnicalScore 0.798561 ->
+    0.816993 on this dev set. Not re-swept exhaustively — a finer grid
+    search or a check against the private 800-sample holdout could still
+    move this further, but returns were already flattening near K=30.
     """
     keyword_hits = index.keyword_candidates(query, top_n)  # list[(asin, score)], best-first
     semantic_hits = index.semantic_candidates(query, top_n)  # list[(asin, score)], best-first
 
-    keyword_weight, semantic_weight = (0.7, 0.3) if track == "buying" else (0.3, 0.7)
+    keyword_weight, semantic_weight = (0.9, 0.1) if track == "buying" else (0.3, 0.7)
     merged: dict[str, float] = {}
     for rank, (asin, _score) in enumerate(keyword_hits):
         merged[asin] = merged.get(asin, 0.0) + keyword_weight / (RRF_K + rank)
