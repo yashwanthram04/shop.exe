@@ -29,6 +29,7 @@ variable fraction of calls, making those runs non-reproducible.
 
 | + Issue 15 (LLM query synthesis, USE_LLM_QUERY_SYNTHESIS) | 0.8401 (regression, kept opt-in) |
 | + Issue 16 (LLM reranking, USE_LLM_RERANK) | 0.7845 (significant regression, kept opt-in) |
+| + Issue 17 (verbatim-overlap-aware rerank prompt, same flag) | 0.8107 (confirms diagnosis, still net negative) |
 
 Remaining open: 5 misses (`public_0020/0083/0095/0096/0126`), all in Buying/
 Intent Override/Browsing. Issue 6 (attrs coverage) is deliberately NOT
@@ -607,7 +608,40 @@ cleanly.
 
 ---
 
-## Fix order
+## Issue 17 — Telling the LLM about the verbatim-match property: confirms the diagnosis, still not a win 🟡 MEDIUM
+
+**Status:** ✅ measured, kept opt-in (same `USE_LLM_RERANK` flag, prompt
+upgraded in place). **0.8451 → 0.8107** — better than Issue 16's blind
+version (0.7845) but still a net regression. Same 5 misses in all three
+configurations.
+
+Issue 16 diagnosed *why* reranking lost: the LLM judges general
+plausibility from a title/attrs summary, never seeing the verbatim-overlap
+signal the formula ranker already exploits. The natural next question —
+does the LLM improve if it's just *told* about that property and given the
+number directly? Built `_verbatim_overlap()` (counts how many of the
+customer's own words appear verbatim in each candidate's text — the same
+computation `_slot_fit_bonus` already does internally, now exposed as a
+visible per-candidate number) and rewrote the system prompt to explicitly
+name the mechanism and instruct the model to weight it heavily.
+
+**Result: partial, genuine recovery, not a fix.** MRR moved from 0.4249
+(v1) to **0.517** (v2) — real, not noise, confirming the diagnosis was
+correct: giving the LLM the actual signal it was missing measurably helps
+its reasoning. But it still trails the pure formula (MRR 0.6286) by a wide
+margin, and the same 5 sessions miss regardless of which rerank version
+runs.
+
+**Why precise beats "please weight this heavily":** the formula doesn't
+just *consider* verbatim overlap — `WEIGHT_SLOT_FIT=0.4` is a single fixed
+number in a deterministic sum, always applied the same way, every time.
+Telling an LLM to "weight X heavily" is a natural-language nudge on top of
+a general-purpose reasoner that's still free to (and does) let other
+considerations pull it away case-by-case. Once a mechanism is correctly
+diagnosed, encoding it directly and precisely outperforms asking a
+language model to approximately honor it — a stronger conclusion than
+either "LLM bad" or "LLM good," and the most useful single insight this
+project's LLM experiments produced.
 
 1. ✅ **Issue 1** — fusion. 0.4342 → 0.6084.
 2. ✅ **Issue 2** — `"other"` probe + stop returning `None` for free. 0.6084 → 0.7891.

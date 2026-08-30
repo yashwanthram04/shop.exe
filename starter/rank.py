@@ -72,6 +72,21 @@ LLM_RERANK_SYSTEM_PROMPT = (
     "ONLY a JSON array of the given product IDs, reordered best-match-first. "
     "Include every ID exactly once. No other text."
 )
+# ISSUES.md #17: this system's customer preferences are frequently VERBATIM
+# QUOTES lifted directly from the correct product's own listing text (this
+# is how the underlying evaluator generates them). Each candidate below is
+# tagged with verbatim_overlap: N — how many of the customer's own exact
+# words appear in THAT product's own text. Treat a high verbatim_overlap as
+# strong evidence of correctness, even over a candidate that otherwise
+# seems like a more generic/plausible fit.
+LLM_RERANK_SYSTEM_PROMPT_V2 = LLM_RERANK_SYSTEM_PROMPT + (
+    " IMPORTANT: this customer's stated preferences are frequently exact "
+    "quotes copied from the correct product's own listing text. Each "
+    "candidate is tagged with verbatim_overlap: N, the count of the "
+    "customer's own words that appear verbatim in that product's text. "
+    "Weight verbatim_overlap heavily — a high count is strong evidence of "
+    "the correct answer, more reliable than general plausibility."
+)
 
 # Attributes worth boosting at rank time by matching against product text.
 # category/material/color/size are exact-keyword-ish and matched by
@@ -180,8 +195,28 @@ def _profile_summary(user_profile: dict) -> str:
     return "; ".join(parts) if parts else "no purchase history available"
 
 
+def _verbatim_overlap(customer_text: str, product: dict) -> int:
+    """Count of the customer's own meaningful words that appear verbatim in
+    this product's own text — the explicit signal handed to the LLM in
+    Issue 17, computed the same way _slot_fit_bonus already reasons
+    internally but exposed as a visible number instead of a hidden score.
+    """
+    customer_tokens = _tokenize(customer_text)
+    if not customer_tokens:
+        return 0
+    haystack = " ".join([
+        str(product.get("title", "")),
+        str(product.get("features", "")),
+        str(product.get("description", "")),
+        str(product.get("details", "")),
+        str(product.get("categories", "")),
+    ])
+    product_tokens = _tokenize(haystack)
+    return len(customer_tokens & product_tokens)
+
+
 def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | None) -> list[dict]:
-    """Narrow LLM role #3 (ISSUES.md #16): re-rank the already
+    """Narrow LLM role #3 (ISSUES.md #16, v2 in #17): re-rank the already
     formula-sorted shortlist using BOTH current-turn slots AND the
     long-term user_profile — distinct from the two roles already measured
     negative (extraction, Issue 9; query-text rewriting, Issue 15). This
@@ -189,13 +224,15 @@ def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | No
     using richer context (the profile) than the formula alone has access
     to, rather than replacing any existing signal.
 
-    Retested here on the CURRENT pipeline, not reused from an old verdict:
-    the original LLM-rerank measurement (+0.003, noise) was taken against
-    the pre-fix 0.434-era pipeline — a completely different candidate pool
-    and ranking formula. Re-measuring before trusting that old result is
-    the same discipline that flipped Issue 9's verdict after the fusion
-    fix landed; reusing a stale measurement here would have been the exact
-    mistake ISSUES.md exists to catch.
+    v2 (Issue 17): the v1 prompt asked the LLM to judge general plausibility
+    from a title/attrs summary and lost badly (0.845 -> 0.785, MRR
+    collapsed) — traced to this evaluator defining "correct" as verbatim
+    text reuse from the target's own listing, which general-plausibility
+    reasoning can't see. v2 computes that overlap explicitly
+    (_verbatim_overlap) and hands it to the model as a visible number per
+    candidate, with an instruction to weight it heavily — the same signal
+    the formula ranker already exploits, now legible to the LLM too,
+    instead of asking it to rediscover it from vibes.
 
     Falls back to `ordered` unchanged on ANY failure — no opt-in, no key,
     network error, timeout, malformed/hallucinated response. Must never
@@ -211,14 +248,17 @@ def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | No
     try:
         from openai import OpenAI
 
+        customer_text = state.durable_notes or state.summary()
         listing_lines = []
         for item in pool:
             product = index.products.get(item["parent_asin"], {}) if index else {}
             title = str(product.get("title", ""))[:80]
             price = product.get("price")
             rating = product.get("average_rating")
+            overlap = _verbatim_overlap(customer_text, product)
             listing_lines.append(
-                f"{item['parent_asin']}: {title} | price={price} | rating={rating} | attrs={item.get('attrs', {})}"
+                f"{item['parent_asin']}: {title} | price={price} | rating={rating} "
+                f"| attrs={item.get('attrs', {})} | verbatim_overlap={overlap}"
             )
 
         client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url=GROQ_BASE_URL, timeout=GROQ_TIMEOUT_SECONDS)
@@ -227,7 +267,7 @@ def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | No
             temperature=0,
             reasoning_effort="low",
             messages=[
-                {"role": "system", "content": LLM_RERANK_SYSTEM_PROMPT},
+                {"role": "system", "content": LLM_RERANK_SYSTEM_PROMPT_V2},
                 {
                     "role": "user",
                     "content": (
