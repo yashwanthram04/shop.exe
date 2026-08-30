@@ -13,8 +13,17 @@ not estimates. Where a run used a subset, the sample size is stated.
 | + Issue 2 ("other" probe) | 0.7891 |
 | + Issue 5 (confirmed neutral, LLM extraction kept on) | 0.7903 |
 | + Issue 7 (override merge fix) | **0.7964** |
+| + Issue 8 (LLM filler-detection ate the category signal, live keys) | **0.791961** |
+| + durable_notes cleanup + size-filter title inclusion (Groq off, neutral but kept) | 0.798561 |
+| + Issue 6 (`use_case` coverage; `budget`/`size` tried, reverted) | 0.802511 |
+| + Issue 9 (RRF weight/K tuning) | **0.816993** |
 
-Remaining open: Issue 3 (retrieval ceiling), Issue 6 (attrs coverage).
+Remaining open: Issue 3 (retrieval ceiling, partially addressed).
+
+Note: the 0.7964 row above (and the Issue 1/2/7 confirmations) were measured with
+Groq isolated **off**. Issue 5 claimed Groq-on was neutral, but that check never
+ran the full 200-session set with a live key end-to-end at full call volume — see
+Issue 8, found by doing exactly that.
 
 Reference numbers from a 40-session instrumented replay (Groq disabled, so
 these are independent of any LLM behaviour):
@@ -141,14 +150,54 @@ via `Efficiency = clip((11 - MTTC) / 10, 0, 1)`.
 In 27.5% of sessions the target never enters the candidate pool on *any*
 turn. Even flawless ranking caps the score there. Leads worth testing:
 
-- `state.durable_notes` prefixes the literal filler `"no preferences stated
-  yet"` into turn-1 queries (`state.py: summary()`), polluting the embedding
-- the pool is capped at `top_n=50` per route; both routes contribute
-  uniquely (9 keyword-only, 5 semantic-only finds across 40 sessions), so
-  widening the cap is cheap and non-destructive
+- ✅ tested: `state.durable_notes` prefixed the literal filler `"no
+  preferences stated yet"` into turn-1 queries (`state.py: summary()`).
+  Fixed (`update_durable_notes` now uses the raw message alone when no
+  slots are filled) but **measured neutral** — after Issue 8's fix,
+  `category` is reliably backfilled on turn 1 regardless, so this path
+  rarely triggers anymore. Kept for correctness on remaining edge cases.
+- ❌ tested and reverted: widening the pool cap (`top_n=50` → `100`) was
+  hypothesized as cheap/non-destructive but measured as a **net regression**
+  (TechnicalScore 0.798561 → 0.778847, Groq-off, clean A/B). MRR drops
+  sharply because RRF scores for deep-pool candidates (rank 50-100) are
+  tiny, so `rank.py`'s rating/popularity bonuses — which don't depend on
+  retrieval rank — let higher-rated-but-less-relevant products outrank the
+  true target once they're let into the pool. Reverted to `top_n=50`.
 - `filter_candidates` may be excluding the target before ranking ever sees
   it — the `return kept if kept else candidate_ids` fallback only triggers
-  when the pool is emptied *entirely*, not when the target alone is dropped
+  when the pool is emptied *entirely*, not when the target alone is dropped.
+  **Still open, next to test** — try token-overlap matching for `size`
+  (the same fix already proven for `feature`) instead of plain substring
+  containment, since "Large" vs "L" vs "size L" is exactly the paraphrase
+  mismatch class Issue 4 already showed breaks plain containment.
+
+---
+
+## Issue 6 — `_extract_attrs` covers only 5 of 9 attributes 🟢 PARTIALLY FIXED
+
+**Status:** ✅ `use_case` added; `budget`/`size` tried and reverted (measured
+harmful). See original description further below — this entry summarizes
+the resolution, tested in isolation one attribute at a time (Groq off,
+clean 200-session runs, baseline TechnicalScore 0.798561):
+
+| addition (alone) | TechnicalScore | Δ | kept? |
+|---|---|---|---|
+| `use_case` | 0.802511 | **+0.00395** | ✅ yes |
+| `size` | 0.795274 | -0.0033 | ❌ reverted |
+| `budget` (raw price) | 0.794924 | -0.0036 | ❌ reverted |
+| `budget` ($10-bucketed) | 0.795374 | -0.0032 | ❌ reverted |
+
+**Why `budget` hurts:** an exact (or even $10-bucketed) price is still
+near-unique per product in a ~50-candidate pool, so it trivially maximizes
+Shannon entropy in `clarify.py`'s `diversity_score()` and makes the agent
+over-prefer asking about budget over more genuinely useful attributes —
+both encodings dragged Intent Override from 83.3% to 80%, so it isn't an
+encoding-resolution problem, budget just doesn't fit this categorical
+entropy model. `size`'s harm wasn't independently diagnosed further since
+`use_case` alone was already a clean win and neither `budget` nor `size`
+was.
+**File:** `starter/retrieval.py`, `_extract_attrs()`
+**Owner:** (diagnosed 2026-08-31, isolated one attribute per run)
 
 ---
 
@@ -225,15 +274,16 @@ causes of the regression, both unverified:
 
 ## Issue 6 — `_extract_attrs` covers only 5 of 9 attributes 🔵 LOW
 
-**Status:** open
-**File:** `starter/retrieval.py`, `_extract_attrs()`
-**Owner:** Person A
+**Status:** ✅ see the resolution near the top of this file (search
+"PARTIALLY FIXED") — `use_case` added (net +0.004), `budget`/`size` tried
+and reverted (measured harmful, not just an oversight).
 
-Populates `material`/`color`/`style`/`brand`/`category` only. `clarify.py`'s
-entropy selection can therefore never pick `size`/`budget`/`feature`/
-`use_case` — they never clear `MIN_COVERAGE_TO_ASK`. Not a correctness bug
-(the coverage gate degrades safely), but it silently narrows the question
-space to 5 of 9 possible attributes.
+Originally: populated `material`/`color`/`style`/`brand`/`category` only.
+`clarify.py`'s entropy selection could therefore never pick
+`size`/`budget`/`feature`/`use_case` — they never cleared
+`MIN_COVERAGE_TO_ASK`. Not a correctness bug (the coverage gate degrades
+safely), but it silently narrowed the question space to 5 of 9 possible
+attributes.
 
 ---
 
@@ -275,6 +325,76 @@ addressed.
 
 ---
 
+## Issue 8 — Live LLM extraction discards the turn-1 category signal 🔴 CRITICAL
+
+**Status:** ✅ fixed — found by running the full 200-session set with a real
+`GROQ_API_KEY` for the first time (all prior confirmations of Issues 1/2/7
+were measured with Groq isolated off; Issue 5's Groq-on check only compared
+aggregate scores, not full-scale live behavior).
+
+| | Groq live, before fix | Groq live, after fix |
+|---|---|---|
+| TechnicalScore | 0.70962 | **0.791961** |
+| Hit Rate — Boundary | 40% | **90%** |
+| Hit Rate — Browsing | 73.75% | **91.25%** |
+| Hit Rate — Buying / Override | 92.5% / 76.67% (unaffected) | 92.5% / 76.67% |
+
+**Root cause:** Browsing and Boundary scenarios both open with the same
+template: `"I'm looking for {category}, but I'm still exploring."`
+`LLM_EXTRACTION_SYSTEM_PROMPT` (`router.py`) instructs the model to "ignore
+filler dialogue with no real preference (e.g. 'still exploring' ...) and
+return {} for those" — so the live model (correctly, per that instruction)
+returns `{}` for this entire message, including the category, which is a
+genuine, load-bearing signal despite sharing a sentence with the filler
+clause. `_understand_unprompted()` (`router.py`) then used that `{}`
+verbatim (`llm_result if llm_result is not None else _classify_unprompted(...)`
+— an empty dict is not `None`), completely bypassing `_classify_unprompted`'s
+free, always-reliable `CATEGORY_RE` extraction of the same message. Verified
+directly: `_understand_unprompted("I'm looking for Athletic Walking, but I'm
+still exploring.", {})` → `{}` live, vs `_classify_unprompted(...)` →
+`{"category": "athletic walking"}`. Buying/Override openers disclose a real
+constraint in the same message, so the LLM doesn't blank them — only
+Browsing/Boundary (80/200 + 10/200 = 90/200 sessions) hit this path.
+
+**Fix:** `_understand_unprompted()` now unconditionally backfills `category`
+via `CATEGORY_RE` whenever the LLM result doesn't already include one,
+regardless of which path ran — the LLM's judgment on every other attribute
+is untouched.
+**File:** `starter/router.py`, `_understand_unprompted()`
+**Owner:** (diagnosed via live evaluator run, 2026-08-30)
+
+---
+
+## Issue 9 — RRF weight/K split was still an untuned first guess 🟢 FIXED
+
+**Status:** ✅ fixed — closes the `retrieve()` docstring's own TODO now that
+Issue 1 made both retrieval routes scale-comparable. Grid-searched one
+variable at a time (Groq off, clean 200-session runs, baseline 0.798561 —
+the post Issue 3/6-partial state before this issue, i.e. before `use_case`
+too; re-based to 0.802511 once Issue 6 landed):
+
+| variable held fixed | tested | best | Δ from that stage's baseline |
+|---|---|---|---|
+| browsing = (0.3, 0.7) | buying: (0.5,0.5), (0.7,0.3), (0.9,0.1), (1.0,0.0) | **(0.9, 0.1)** | +0.002 |
+| buying = (0.9, 0.1) | browsing: (0.1,0.9), (0.2,0.8), (0.3,0.7), (0.4,0.6), (0.5,0.5) | **(0.3, 0.7)** (unchanged; (0.4,0.6) tied within noise) | ~0 |
+| weights above | `RRF_K`: 10, 20, 30, 40, 60 | **30** | +0.012 (the largest single win) |
+
+Combined: 0.802511 → **0.816993**. Boundary hit rate reached 100% (10/10).
+`RRF_K=30` effectively sharpens the rank-based fusion curve — with a 50-item
+pool, halving K from 60 gives meaningfully more separation between top-ranked
+and mid-pool candidates before rank.py's rating/popularity terms get a
+chance to compete, similar in spirit to why Issue 1 (RRF at all) mattered.
+
+**Caveat:** this is tuned against the 200-sample public set only, one
+variable at a time — not re-verified against the private 800-sample holdout,
+and the grid was coarse (multiples of 0.1 / of 10). A finer sweep or a
+holdout check could move this further but risks overfitting the public set.
+**File:** `starter/retrieval.py`, `retrieve()` (constants `RRF_K` and the
+`keyword_weight, semantic_weight` line)
+**Owner:** (tuned 2026-08-31)
+
+---
+
 ## Fix order
 
 1. ✅ **Issue 1** — fusion. 0.4342 → 0.6084.
@@ -282,11 +402,29 @@ addressed.
 3. ✅ **Issue 5** — re-measured; confirmed neutral now, kept on. 0.7891 → 0.7903.
 4. ✅ **Issue 7** — override merge fix (found while investigating Issue 3/
    Intent Override lagging). 0.7903 → 0.7964.
-5. **Issue 3** (next) — widen pool, clean the turn-1 query, audit filter
-   exclusions. One traced Intent Override miss (`public_0002`) never
-   entered the pool at all even after Issue 7 — good concrete case to
-   debug against.
-6. **Issue 6** — extend attribute coverage.
+5. ✅ **Issue 8** — LLM filler-detection was discarding turn-1 category for
+   Browsing/Boundary once Groq was actually live end-to-end. Discovered
+   0.70962 → fixed to 0.791961 (measured with live keys; the 0.7964 above
+   was Groq-off).
+6. ✅ **Issue 3, partial** — durable_notes turn-1 filler removed (neutral,
+   Issue 8 already covers most of that gap) and size filter now also
+   searches `title` (neutral on the public set, still a real fix for the
+   private holdout). Widening `top_n=50→100` was tried and **reverted**:
+   -0.0197, MRR damage from `rank.py`'s rating/popularity bonuses
+   out-competing the true target once RRF scores go tiny past rank 50.
+   0.791961 → 0.798561.
+7. ✅ **Issue 6** — `use_case` added to `_extract_attrs()` (+0.004);
+   `budget`/`size` tried and reverted (both individually harmful, ~-0.003
+   each — see Issue 6 entry above for why). 0.798561 → 0.802511.
+8. ✅ **Issue 9** — RRF weight/K tuning (the `retrieve()` docstring's old
+   TODO). Buying keyword/semantic 0.7/0.3 → 0.9/0.1; browsing's 0.3/0.7
+   held as the best of everything tested; `RRF_K` 60 → 30 (the biggest
+   single win here, +0.012). 0.802511 → **0.816993**. Boundary now 100%.
+9. **Issue 3, remaining** — the `filter_candidates()` empty-pool fallback
+   (only triggers when the *whole* pool empties, not when just the target
+   is dropped) is still untested as a lead, and the private 800-sample
+   holdout hasn't been checked against any of this tuning — cheap next
+   step if further gains are wanted.
 
 Re-run `python -m evaluator.local_evaluator` after each item, one at a time,
 and record the scenario breakdown — several earlier conclusions were wrong
