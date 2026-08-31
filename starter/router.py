@@ -70,6 +70,19 @@ USE_CASE_WORDS = ("hiking", "running", "gym", "winter", "outdoor", "work")
 BOUNDARY_PHRASES = ("no preference", "whatever", "doesn't matter", "don't care", "any is fine", "up to you", "your judgment")
 OVERRIDE_PHRASES = ("actually", "instead", "forget", "change my mind", "no longer", "ignore my earlier", "on second thought")
 
+# TRIED AND REVERTED (see ISSUES.md-style note): stripping catalog
+# boilerplate ("imported" is in 30.3% of the whole catalog, "pull on
+# closure" 14.4%) out of the stored "feature" slot measured as a net
+# regression (0.858458 -> 0.852714, 2 new misses) despite the sound theory.
+# Root cause: state.update_durable_notes() folds the CURRENT TURN's raw
+# message into the query regardless of what got parsed into a slot, so the
+# boilerplate still pollutes that turn's retrieval either way — removing it
+# from storage only changes which attribute clarify.py asks about next,
+# which had unpredictable knock-on effects on which candidates got frozen
+# into the pool once no further slot got filled. Would need filtering at
+# the raw-message level (durable_notes construction), not slot storage, to
+# actually test the original hypothesis cleanly — not attempted here.
+
 # A number only counts as a budget when it sits next to an actual price
 # cue — either a currency symbol, or a budget word within a few characters.
 #
