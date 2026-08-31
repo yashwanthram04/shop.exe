@@ -62,4 +62,17 @@ Use this file to record each local evaluator run. Keep one entry per run with th
 
 ---
 
+### Run 2026-08-31 (memory branch, live keys, full end-to-end)
+- TechnicalScore: 0.817693
+- HitRate@10: 0.92
+- MRR: 0.662643
+- MTTC: 3.055
+- Efficiency: 0.7945
+- Buying: 0.925
+- Browsing: 0.9375
+- Intent Override: 0.833333
+- Boundary: 1.0
+- Note: memory branch = main's 0.809543 run + the edge-case-audit branch's `clear_freeform_override` fix (also clears `filled_null`/`asked_categories`, not just `filled_slots`). +0.008 over main, concentrated in Browsing (+0.0125) and Intent Override (+0.033) — the scenarios that touch override/boundary-clearing state.
+
+---
 
