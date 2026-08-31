@@ -47,3 +47,14 @@ Use this file to record each local evaluator run. Keep one entry per run with th
 - Note: Fresh baseline run from python -m evaluator.local_evaluator. Browsing is the major weakness, buying is much stronger, boundary is zero, and the overall score matches the documented baseline reference for the starter agent.
 
 ---
+
+### Run 2026-08-31 (main, live keys)
+- TechnicalScore: 0.843143
+- HitRate@10: 0.985
+- MRR: 0.607478
+- MTTC: 2.58
+- Efficiency: 0.842
+- Buying: 0.975
+- Browsing: 1.0
+- Intent Override: 0.966667
+- Boundary: 1.0
