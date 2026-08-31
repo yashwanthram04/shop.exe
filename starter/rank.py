@@ -54,8 +54,8 @@ import re
 from .state import SessionState
 
 WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14/#19 for the sweeps that picked this value
-WEIGHT_SLOT_FIT = 0.5  # see ISSUES.md #26 -- re-tuned after SLOT_FIT_CAP; 0.5-0.7 tie, 0.5 kept as the minimal value
-SLOT_FIT_CAP = 1.0  # see ISSUES.md #26 -- best measured cap on the raw (pre-weight) bonus
+WEIGHT_SLOT_FIT = 0.5  # see ISSUES.md #26/#27 -- 0.3-0.6 tie at cap=2.5, 0.5 kept mid-plateau
+SLOT_FIT_CAP = 2.5  # see ISSUES.md #27 -- re-tuned after merging with the category-matching fix (Issue 22's neighbor); 1.0 was calibrated before category contributed to the sum
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
 WEIGHT_VERBATIM = 0.0  # see ISSUES.md #20 for the sweep that picks this value -- tested, rejected, kept off
@@ -111,16 +111,26 @@ LLM_RERANK_SYSTEM_PROMPT_V2 = LLM_RERANK_SYSTEM_PROMPT + (
 )
 
 # Attributes worth boosting at rank time by matching against product text.
-# category/material/color/size are exact-keyword-ish and matched by
-# substring containment; feature is free-text and matched by loose token
-# overlap instead (see FREE_TEXT_FIELDS below). style/brand/use_case are
-# still skipped — no reliable per-product signal for them yet.
+# material/color/size are exact-keyword-ish and matched by substring
+# containment; category/feature are free-text blurbs and matched by loose
+# token overlap instead (see FREE_TEXT_FIELDS below). style/brand/use_case
+# are still skipped — no reliable per-product signal for them yet.
 SOFT_FIELDS_FOR_FIT = ("category", "material", "color", "size", "feature")
 
-# Attributes whose slot value is a blurb, not a keyword — matched by
+# Attributes whose slot value is a blurb, not a single keyword — matched by
 # shared meaningful words instead of requiring the exact phrase to appear
 # verbatim in the product's text.
-FREE_TEXT_FIELDS = {"feature"}
+#
+# `category` was previously matched by exact substring containment like
+# material/color, but a customer-phrased category is a multi-word phrase
+# (e.g. "tees & blouses tunics") that essentially never appears verbatim in
+# product text — silently zeroing this bonus for nearly every session,
+# worst on turn-1 hits where category is the only known slot (confirmed:
+# public_0041 hit turn 1 at rank 9 with bonus_slot=0.000 across the entire
+# top-10). retrieval.py's own filter_candidates() already solves this exact
+# problem correctly via word-overlap containment — this fixes the same gap
+# here by reusing the token-overlap path already proven for `feature`.
+FREE_TEXT_FIELDS = {"category", "feature"}
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = {

@@ -34,9 +34,9 @@ Turn 3
 Turn 4
   Customer : I don't have an additional preference for brand.
   Agent    : 'Do you have a color preference?'  (ask_attribute='color')
-  Top-10   : HIT, rank 3
+  Top-10   : HIT, rank 1
 
-RESULT: HIT at turn 4, rank 3
+RESULT: HIT at turn 4, rank 1
 
 =================================================================================
 [BOUNDARY — customer has no preference]  sample_id=public_0180  target=B01HSMYV8E
@@ -86,7 +86,7 @@ RESULT: HIT at turn 7, rank 8
 Turn 1
   Customer : I'm looking for Athletic Walking. Lightweight and responsive Ultra Go midsole cushioning
   Agent    : 'Is there anything else that matters to you?'  (ask_attribute='other')
-  Top-10   : miss
+  Top-10   : HIT, rank 2
 
 Turn 2
   Customer : For that, what matters is: Imported; Rubber sole.
@@ -106,24 +106,14 @@ Turn 4
 Turn 5
   Customer : I don't have an additional preference for color.
   Agent    : 'Do you have a style preference?'  (ask_attribute='style')
-  Top-10   : miss
+  Top-10   : HIT, rank 9
 
-Turn 6
-  Customer : I don't have an additional preference for style.
-  Agent    : 'Is there anything else that matters to you?'  (ask_attribute='other')
-  Top-10   : miss
-
-Turn 7
-  Customer : For that, what matters is: Dual-density outsole with Hyper Pillar comfort technology; Lightweight and responsive Ultra Go midsole cushioning.
-  Agent    : 'Is there anything else that matters to you?'  (ask_attribute='other')
-  Top-10   : HIT, rank 1
-
-RESULT: HIT at turn 7, rank 1
+RESULT: HIT at turn 5, rank 9
 
 ============================================================
 SUMMARY
 ============================================================
   buying           public_0005    turn 1, rank 1
-  browsing         public_0087    turn 4, rank 3
+  browsing         public_0087    turn 4, rank 1
   boundary         public_0180    turn 7, rank 8
-  intent_override  public_0068    turn 7, rank 1
+  intent_override  public_0068    turn 5, rank 9

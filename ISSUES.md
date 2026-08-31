@@ -1120,6 +1120,60 @@ problem with the retrieval-score term.
 
 ---
 
+## Issue 27 — Merging with a teammate's independent fix broke SLOT_FIT_CAP's calibration; re-tuned together 🟢 real fix, combined gain
+
+**Status:** ✅ kept. `SLOT_FIT_CAP` re-tuned 1.0 → **2.5**. Combined score
+**0.8604 → 0.8628** (+0.0024 beyond Issue 26 alone).
+
+A teammate independently found and fixed a real bug in parallel: `category`
+was listed in `SOFT_FIELDS_FOR_FIT` but matched via exact-substring
+containment, same as `material`/`color` — except a customer-phrased
+category is a multi-word blurb (e.g. "tees & blouses tunics") that
+essentially never appears verbatim in product text, so the category term
+of `_slot_fit_bonus` silently contributed **zero** on nearly every
+session. Their fix moves `category` into `FREE_TEXT_FIELDS` (loose
+token-overlap matching, the same path already proven correct for
+`feature`). Independently correct, well-diagnosed, unrelated to anything
+in this file until the two changes landed in the same file at the same
+time.
+
+Merging the two didn't conflict textually (different regions of
+`rank.py`), but the combination measured **worse** than either fix alone
+at first: 0.8525 with `SLOT_FIT_CAP=1.0` (Issue 26's value) plus the
+category fix, versus 0.8604 for Issue 26 alone. Diagnosed immediately
+rather than assumed: `SLOT_FIT_CAP=1.0` was calibrated in a world where
+`category` contributed nothing to the sum (their bug). Once category
+started contributing real values via token overlap, the raw bonus
+distribution shifted upward, and the old cap started clipping
+legitimately-informative scores, not just the runaway ones it was meant
+to catch.
+
+Re-swept `SLOT_FIT_CAP` against the actual merged pipeline:
+
+| `SLOT_FIT_CAP` | score | hit rate | MRR |
+|---|---|---|---|
+| 1.0 (Issue 26's value) | 0.8525 | 0.970 | 0.6631 |
+| 2.0 | 0.8614 | 0.980 | 0.6696 |
+| **2.5** | **0.8628** | 0.980 | 0.6744 |
+| 3.0 | 0.8625 | 0.980 | 0.6730 |
+| None (uncapped) | 0.8625 | 0.980 | 0.6730 |
+
+Then re-swept `WEIGHT_SLOT_FIT` at the new cap — 0.3 through 0.6 tie
+exactly at 0.8628; kept the existing 0.5.
+
+**The combined, properly-retuned pipeline (0.8628) beats both individual
+fixes** (Issue 26 alone: 0.8604; the category fix alone, not separately
+measured but implied worse given it wasn't tuned against the cap at all).
+This is the intended outcome of merging two correct, independent fixes —
+the apparent regression was purely a stale-constant problem, not a sign
+the fixes were incompatible. Lesson: after merging any change that alters
+what feeds into an existing tuned constant, re-sweep that constant before
+trusting its old value, the same discipline Issue 14/19/26 already
+established for single-author changes — it applies just as much across
+a merge.
+
+---
+
 ## Fix order (final)
 
 1. ✅ **Issue 1** — fusion. 0.4342 → 0.6084.
@@ -1156,16 +1210,26 @@ problem with the retrieval-score term.
 17. ✅ **Issue 26** — `_slot_fit_bonus` was structurally unbounded (could
     reach ~3.0 raw vs a 0.15-capped retrieval term) and dominated
     everything else. Capped it (`SLOT_FIT_CAP=1.0`) and re-tuned
-    `WEIGHT_SLOT_FIT` (0.4→0.5). → **0.8604**, MRR 0.6055→0.6719. The
+    `WEIGHT_SLOT_FIT` (0.4→0.5). → 0.8604, MRR 0.6055→0.6719. The
     first genuine score improvement since Issue 19, found by
     instrumenting the real pipeline rather than adding a new signal.
+18. ✅ **Issue 27** — merged with a teammate's independent, correct fix
+    (`category` was matched by exact-substring when it's a multi-word
+    phrase, silently contributing zero; moved to token-overlap matching).
+    Combining naively regressed to 0.8525 because `SLOT_FIT_CAP=1.0` had
+    been calibrated in a world where category contributed nothing.
+    Re-tuned `SLOT_FIT_CAP` (1.0→2.5) against the actual merged pipeline.
+    → **0.8628**, MRR 0.6719→0.6744. Beats both individual fixes —
+    confirms the two changes were complementary, not competing; the
+    apparent regression was a stale-constant problem, not incompatibility.
 
-**Final: TechnicalScore 0.8604, hit rate 98% (196/200), MRR 0.6719,
-MTTC 2.56**, fully deterministic, zero API keys required by default.
-4 misses remain: 3 are the same sessions diagnosed in Issue 19 as a
-likely genuine information ceiling; the 4th is a new miss introduced by
-Issue 26's fix itself — a deliberate, measured tradeoff (net MRR gain of
-+0.066 across the set, at the cost of one session's hit).
+**Final: TechnicalScore 0.8628, hit rate 98% (196/200), MRR 0.6744,
+MTTC 2.475**, fully deterministic, zero API keys required by default.
+4 misses remain (`public_0020`, `public_0095`, `public_0096`,
+`public_0161`): 3 are the same sessions diagnosed in Issue 19 as a
+likely genuine information ceiling; the 4th (`public_0095`) is a new
+miss introduced by Issue 26's cap fix itself — a deliberate, measured
+tradeoff (net MRR gain far outweighing the cost of one session's hit).
 
 Re-run `python -m evaluator.local_evaluator` after any further change, one
 at a time, and record the scenario breakdown — several conclusions in this

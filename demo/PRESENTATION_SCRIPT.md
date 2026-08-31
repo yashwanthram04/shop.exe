@@ -1,6 +1,6 @@
 # Shopping Copilot — Full Demo Script
 
-*Aligned to the final 5-slide deck (shopping.pdf) plus the live `demo/run_demo.py` walkthrough. Slides ~3:20, demo ~1:55, total ~5:15 at 150 wpm. Trim notes at the bottom.*
+*Aligned to the final 5-slide deck (shopping.pdf) plus the live `demo/run_demo.py` walkthrough. Slides ~3:20, demo ~2:35, total ~6:00 at 150 wpm. Trim notes at the bottom.*
 
 ---
 
@@ -73,10 +73,12 @@
 
 > And the hardest one. On turn three the customer reverses course: actually, ignore my earlier preference. The agent drops what it had assumed, re-anchors on the new constraint, and recovers to a hit on turn seven, still inside the ten-turn budget.
 
-## Demo 7 — Summary
-**[1:50–2:05]** · **ON SCREEN:** scroll to the `SUMMARY` block at the bottom of the output
+## Demo 7 — Close
+**[1:50–2:35]** · **ON SCREEN:** hold on the `SUMMARY` block for the first half, then cut back to the title slide for the last few lines
 
-> Four scenarios, four hits: turns one, five, five and seven. Same pipeline, same code path, no special-casing for any of them. That's the behaviour behind the ninety-eight point five percent hit rate across the full two hundred sessions.
+> Four scenarios, four hits — turns one, five, five, and seven — and there's no separate pipeline behind any of them; it's the same loop every time, adapting to whatever the conversation gives it. We picked these four because they show each behaviour clearly, but they aren't exceptions: the same patterns are what drive the ninety-eight and a half percent hit rate across all two hundred sessions.
+>
+> And that's the point. Nobody should have to guess the right keywords to find the right product. They should be able to talk like a person, change their mind halfway through, and still end up with exactly what they wanted. That's Shopping Copilot — thanks for watching.
 
 ---
 

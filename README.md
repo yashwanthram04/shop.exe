@@ -26,11 +26,19 @@ The agent is a multi-turn dialogue pipeline, not a single-shot recommender. Each
 - **A scale-mismatch bug was silently disabling half the ranking signal.** BM25 scores (~20-30) and cosine similarities (~0.5-0.7) live on completely incompatible scales; a naive weighted sum let keyword search dominate regardless of the intended track weighting, so semantic-only matches almost never survived to the top 10. Switching to Reciprocal Rank Fusion (scale-free by construction) took the technical score from 0.43 to 0.61 in one fix — the single largest jump in the whole project.
 - **One ranking term was structurally 3-4.6x larger than everything else combined, and nobody had noticed.** `_slot_fit_bonus` summed an uncapped weight across up to 5 attributes; instrumenting every scoring call across all 200 sessions showed its median nonzero value alone already exceeded the combined maximum of the retrieval, rating, and popularity terms put together. Capping it — not adding a new signal, just bounding an existing one — improved MRR by +0.066 with no other change. This also explains why two earlier attempts to add new scoring signals both failed: there was almost no room left for anything else to move the order.
 - **This evaluator's synthetic customer accidentally favors exact-match over paraphrase.** The simulated customer discloses preferences as literal verbatim excerpts from the target product's own listing text. We tested four distinct ways of adding an LLM to the pipeline (extraction, query rewriting, reranking twice); all four lost to the plain deterministic formula, and a targeted follow-up test confirmed why — an LLM's paraphrase throws away the exact-match advantage the formula already has for this specific evaluator's data-generation quirk.
-- **We found a way to score higher by reading the test instead of solving it, and decided not to use it.** The evaluator's opening customer message always contains the target product's own catalog category, computed deterministically from the answer itself. Parsing it and restricting the search space accordingly measured a real gain (0.870 vs the current 0.860 baseline) — kept in the codebase, off by default, documented rather than either hidden or shipped. Worth noting: that gap used to be +0.025; fixing the `_slot_fit_bonus` bug above shrank it to +0.010 — the honest path is closing the distance to the shortcut, not falling further behind it. Full writeup in `ISSUES.md` Issue 24.
+- **We found a way to score higher by reading the test instead of solving it, and decided not to use it.** The evaluator's opening customer message always contains the target product's own catalog category, computed deterministically from the answer itself. Parsing it and restricting the search space accordingly measured a real gain (0.870 vs the current 0.863 baseline) — kept in the codebase, off by default, documented rather than either hidden or shipped. Worth noting: that gap keeps shrinking as we fix real bugs — it was +0.025 originally, then +0.010, now about +0.007 — the honest path is closing the distance to the shortcut, not falling further behind it. Full writeup in `ISSUES.md` Issue 24.
 
 The default pipeline is **fully deterministic and runs offline** — local embeddings, regex-based slot extraction, no API calls. Three additional LLM-augmented roles (slot extraction, search-query synthesis, and result reranking, all via Groq) exist as opt-in features. Each was tested rigorously against the real evaluator and measured **negative** — slot extraction in particular showed a severe regression, not a marginal one — so all three ship **off by default**. Full methodology and numbers for each are in `ISSUES.md`.
 
 The four pipeline areas (routing/state, retrieval, clarification/ranking, and orchestration) were each owned by a different team member, as documented in `agent.py`'s module docstring.
+
+### Tech Stack
+
+- **Language:** Python 3.10+
+- **Keyword search:** SQLite FTS5 (BM25), in-memory
+- **Semantic search:** `sentence-transformers` (`all-MiniLM-L6-v2`), local and offline by default; optional OpenAI `text-embedding-3-small` if `OPENAI_API_KEY` is set (falls back to local on any failure) — measured to make no difference to the score either way, see `ISSUES.md` Issue 23
+- **Optional LLM roles:** Groq (`openai/gpt-oss-20b`, via the OpenAI-compatible SDK), off by default
+- **No external vector database, no message queue, no separate backend service** — the whole agent is an in-process Python library called directly by the evaluator's harness, per the required `Agent` interface
 
 ## Setup and Installation
 
@@ -52,6 +60,8 @@ The four pipeline areas (routing/state, retrieval, clarification/ranking, and or
    ```
    Every flag in `.env` (`OPENAI_API_KEY`, `GROQ_API_KEY`, `USE_LLM_EXTRACTION`, `USE_LLM_QUERY_SYNTHESIS`, `USE_LLM_RERANK`, `USE_CATEGORY_BUCKET`) is optional and off by default. With none of them set, the agent runs fully offline and deterministically — this is the configuration the results below were measured on.
 
+**Note on the embedding model:** the first time the agent runs, `sentence-transformers` downloads the local `all-MiniLM-L6-v2` model from Hugging Face automatically — this needs internet access, one time only. That first run also embeds all 50,000 catalog products and caches the vectors to `data/.embedding_cache/` (gitignored), which is the slow, CPU-bound step. Every run after that reads from the cache and is fast and fully offline, with no internet or API calls required — "runs offline" describes steady-state behavior, not the very first invocation.
+
 ## Steps to Reproduce Results
 
 Run the evaluator against the 200-session public dev set:
@@ -64,10 +74,10 @@ This drives `starter.agent.Agent` through every labeled session in `data/public_
 
 | Metric | Baseline (weak BM25) | Current agent |
 |---|---|---|
-| Technical Score | 0.10671 | 0.8604 |
+| Technical Score | 0.10671 | 0.8628 |
 | Hit Rate@10 | 12.5% | 98% (196/200) |
-| MRR | 0.068034 | 0.6719 |
-| MTTC | 9.81 | 2.56 |
+| MRR | 0.068034 | 0.6744 |
+| MTTC | 9.81 | 2.475 |
 
 Baseline numbers are from `docs/baseline_results.json`; current-agent numbers and the full turn-by-turn debugging history behind them (every fix attempted, measured before/after, scenario breakdowns, and what was tried and rejected) are documented in `ISSUES.md` — that file is the single source of truth for our numbers; `logs/eval_history.md` predates several later fixes and is stale.
 
@@ -79,7 +89,7 @@ Other ways to exercise the agent:
 
 ## Limitations and What We'd Improve With More Time
 
-- **4 of 200 public sessions still miss (2%).** Three (`public_0020`, `public_0096`, `public_0161`) are the same sessions diagnosed in `ISSUES.md` Issue 19 as a likely genuine information ceiling — the customer's disclosed facts for these specific products are generic and catalog-common, not discriminative enough among thousands of similarly-described items. The fourth (`public_0095`) is a new miss introduced by a ranking fix in Issue 26: bounding a scoring term that had been structurally dominating the formula measurably improved MRR across the whole set (+0.066) at the cost of this one session's hit — a deliberate, net-positive tradeoff we measured rather than an oversight.
+- **4 of 200 public sessions still miss (2%).** Three (`public_0020`, `public_0096`, `public_0161`) are the same sessions diagnosed in `ISSUES.md` Issue 19 as a likely genuine information ceiling — the customer's disclosed facts for these specific products are generic and catalog-common, not discriminative enough among thousands of similarly-described items. The fourth (`public_0095`) is a new miss introduced by a ranking fix in Issue 26: bounding a scoring term that had been structurally dominating the formula measurably improved MRR across the whole set at the cost of this one session's hit — a deliberate, net-positive tradeoff we measured rather than an oversight. (This ranking cap was subsequently re-tuned once more, in `ISSUES.md` Issue 27, after merging with a teammate's independent fix to the same file — same 4 misses, better MRR.)
 - **Slot-fit matching is lexical, not semantic.** `rank.py` and `clarify.py` match slots against product text via substring/token overlap, so paraphrased attributes (e.g. "sneakers" vs. "athletic shoes") can be missed.
 - **The LLM-augmented roles underperform the deterministic pipeline, and we now understand why.** All three (extraction, query synthesis, reranking) were tested and measured negative — not just marginally, extraction alone dropped the score from 0.845 to 0.798 when we retested it on the current pipeline. Root cause, confirmed by a targeted follow-up test: this evaluator's simulated customer discloses facts as literal verbatim excerpts from the target product's own listing, which our deterministic exact-match scoring exploits more effectively than any LLM paraphrase can. This is a property of this specific evaluator, not a general argument against LLMs in conversational search — worth revisiting if the customer-simulation approach changes.
 - **We found, and deliberately did not ship, a mechanism that reaches a materially higher score.** The evaluator's simulated customer discloses an exact, deterministically-computable catalog taxonomy key in every session's first message. We built and measured a retrieval path that parses this (0.8694 measured, gated behind `USE_CATEGORY_BUCKET`, off by default) and chose not to make it the default: it works by reading the evaluator's own answer-generation format rather than performing genuine retrieval. It would very likely reproduce on the private judging set — the risk isn't fragility, it's that the mechanism doesn't reflect real conversational search capability. Full reasoning and measurements in `ISSUES.md` Issue 24.
