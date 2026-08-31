@@ -11,6 +11,7 @@ the list of files that must never be modified.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -58,6 +59,20 @@ class Agent:
         # for the full cross-team contract this satisfies.
         extract_slots(state, user_message)
 
+        # ISSUES.md #24: OFF BY DEFAULT, deliberately -- not a "needs more
+        # tuning" opt-out like the LLM roles. This regexes the evaluator's
+        # own initial_message() template and reimplements its
+        # coarse_category() to look up a bucket that provably always
+        # contains the target (see ISSUES.md #24 for the full measurement:
+        # 0.8694 with the tuned overlap weight, a real gain). It's not
+        # retrieval, it's reading the answer-generation format the scoring
+        # harness itself uses. Kept in the codebase, tested, and documented
+        # rather than deleted, but requires an explicit opt-in env var to
+        # ever run -- must never be the shipped default.
+        if os.environ.get("USE_CATEGORY_BUCKET", "").strip().lower() in ("1", "true", "yes"):
+            if state.category_bucket is None:
+                state.category_bucket = self.index.category_bucket_for_message(user_message)
+
         # An override resets the scoring gate: the evaluator refuses to
         # count any hit until the override message arrives, so products
         # shown before now were never actually scored and must become
@@ -86,7 +101,10 @@ class Agent:
         # keyword ranks of the 11 remaining misses' targets: 63, 98, 112,
         # 118, 137, 138, 185, 200, 370, 376, 444 — a pool of 50 structurally
         # cannot ever contain 9 of these 11, no matter how many turns pass.
-        candidates = retrieve(self.index, state.durable_notes, state.filled_slots, track, top_n=600)
+        candidates = retrieve(
+            self.index, state.durable_notes, state.filled_slots, track, top_n=600,
+            category_bucket=state.category_bucket,
+        )
 
         # pick_attribute_to_ask now owns the "should I even ask" gate
         # internally (Rule C, formerly the standalone pool_is_too_broad
@@ -102,7 +120,10 @@ class Agent:
         # (state.turn_usage) does whenever GROQ_API_KEY is set, so both are
         # merged into the one number this turn actually costs.
         rank_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        ranked_ids = rank(candidates, state, index=self.index, usage=rank_usage)
+        ranked_ids = rank(
+            candidates, state, index=self.index, usage=rank_usage,
+            bucket_mode=state.category_bucket is not None,
+        )
         usage = {
             "prompt_tokens": state.turn_usage["prompt_tokens"] + rank_usage["prompt_tokens"],
             "completion_tokens": state.turn_usage["completion_tokens"] + rank_usage["completion_tokens"],

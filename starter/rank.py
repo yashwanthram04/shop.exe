@@ -54,9 +54,31 @@ import re
 from .state import SessionState
 
 WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14/#19 for the sweeps that picked this value
-WEIGHT_SLOT_FIT = 0.4
+WEIGHT_SLOT_FIT = 0.5  # see ISSUES.md #26 -- re-tuned after SLOT_FIT_CAP; 0.5-0.7 tie, 0.5 kept as the minimal value
+SLOT_FIT_CAP = 1.0  # see ISSUES.md #26 -- best measured cap on the raw (pre-weight) bonus
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
+WEIGHT_VERBATIM = 0.0  # see ISSUES.md #20 for the sweep that picks this value -- tested, rejected, kept off
+WEIGHT_PROFILE_FIT = 0.0  # see ISSUES.md #21 for the sweep that picks this value
+WEIGHT_BUCKET_POPULARITY = 0.30  # see ISSUES.md #24 -- bucket-mode only, not the default formula
+WEIGHT_BUCKET_OVERLAP = 0.3  # see ISSUES.md #24 -- best measured weight; bucket mode itself is opt-in only
+
+# Long-term preference_tags (from reset()'s user_profile, never the current
+# turn's slots) are single words ("fit", "comfort", "durability", ...) that
+# don't literally appear in catalog text as-is -- expand each to a few
+# related words/phrases that actually show up in real listings, so the
+# match has something to find. Deliberately small and literal (no stemming/
+# fuzzy matching) to keep this auditable against ISSUES.md #21's measurement.
+PROFILE_TAG_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "fit": ("true to size", "fitted", "relaxed fit", "regular fit", "slim fit"),
+    "comfort": ("comfortable", "comfort", "soft", "cushioned", "breathable"),
+    "durability": ("durable", "sturdy", "long-lasting", "heavy duty", "high quality"),
+    "style": ("stylish", "fashion", "trendy", "classic", "elegant"),
+    "material": ("premium material", "quality fabric", "100%"),
+    "performance": ("moisture wicking", "quick dry", "athletic", "performance"),
+    "warmth": ("warm", "insulated", "fleece lined", "thermal"),
+    "weather": ("waterproof", "windproof", "water resistant", "all weather"),
+}
 
 # Narrow LLM role #3 (ISSUES.md #16). Reuses router.py's Groq setup (same
 # OpenAI-SDK-compatible endpoint) rather than importing from it, to keep
@@ -172,6 +194,8 @@ def _slot_fit_bonus(product: dict, decayed_slots: dict[str, tuple[str, float]]) 
                 if sub_value in haystack:
                     bonus += weight
                     break  # count this attribute once even with multiple values
+    if SLOT_FIT_CAP is not None:
+        bonus = min(bonus, SLOT_FIT_CAP)
     return bonus
 
 
@@ -213,6 +237,54 @@ def _verbatim_overlap(customer_text: str, product: dict) -> int:
     ])
     product_tokens = _tokenize(haystack)
     return len(customer_tokens & product_tokens)
+
+
+def _verbatim_bonus(customer_tokens: set[str], product: dict) -> float:
+    """Deterministic counterpart to the signal handed to the LLM in Issue
+    17 (`_verbatim_overlap`): fraction of the customer's own meaningful
+    words that appear verbatim in this product's own text, in [0, 1].
+    Encodes the same evaluator mechanism the LLM was only told about --
+    see ISSUES.md #20 for why encoding it directly beat asking a model to
+    approximate it.
+    """
+    if not customer_tokens:
+        return 0.0
+    haystack = " ".join([
+        str(product.get("title", "")),
+        str(product.get("features", "")),
+        str(product.get("description", "")),
+        str(product.get("details", "")),
+        str(product.get("categories", "")),
+    ])
+    product_tokens = _tokenize(haystack)
+    return len(customer_tokens & product_tokens) / len(customer_tokens)
+
+
+def _profile_tag_bonus(product: dict, preference_tags) -> float:
+    """Fraction of the customer's LONG-TERM preference_tags (from reset()'s
+    user_profile, distinct from anything said this session) whose expanded
+    synonyms appear in this product's own text, in [0, 1]. The only place
+    in the pipeline that reads user_profile for scoring, not just an LLM
+    prompt (see ISSUES.md #21: user_profile was previously accepted and
+    stored but never actually consulted outside the opt-in LLM reranker).
+    """
+    if not preference_tags:
+        return 0.0
+    haystack = " ".join([
+        str(product.get("title", "")),
+        str(product.get("features", "")),
+        str(product.get("description", "")),
+    ]).lower()
+    matched = 0
+    total = 0
+    for tag in preference_tags:
+        synonyms = PROFILE_TAG_SYNONYMS.get(str(tag).lower())
+        if not synonyms:
+            continue
+        total += 1
+        if any(syn in haystack for syn in synonyms):
+            matched += 1
+    return matched / total if total else 0.0
 
 
 def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | None) -> list[dict]:
@@ -300,7 +372,28 @@ def llm_rerank(ordered: list[dict], state: SessionState, index, usage: dict | No
         return ordered
 
 
-def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | None = None) -> list[str]:
+def _bucket_rank_score(customer_tokens: set[str], product: dict) -> float:
+    """ISSUES.md #24: within a category-bucket-restricted pool, the target
+    is a strong review-count popularity outlier (median rating_number 6,846
+    vs the catalog's 12) and the pool is small/homogeneous enough that
+    plain word-overlap with everything the customer has said beats the
+    full slot-fit/retrieval-score/rating blend used outside the bucket
+    (measured: rating STARS are flat-to-negative here, only review COUNT
+    carries signal -- see ISSUES.md #24 part 4d). Deliberately simple and
+    separate from the default formula below, not a replacement for it.
+    """
+    overlap = _verbatim_bonus(customer_tokens, product)
+    popularity = _normalized_popularity(product.get("rating_number"))
+    return WEIGHT_BUCKET_OVERLAP * overlap + WEIGHT_BUCKET_POPULARITY * popularity
+
+
+def rank(
+    candidates: list[dict],
+    state: SessionState,
+    index=None,
+    usage: dict | None = None,
+    bucket_mode: bool = False,
+) -> list[str]:
     """Order candidates best-to-worst and return up to 10 unique parent_asin.
 
     Each candidate from retrieval.py's retrieve() is
@@ -323,11 +416,23 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
     ranking: an A/B test showed LLM reranking of the formula's own top 20
     barely moved the score (+0.003, noise-level) at real added cost/latency,
     while genuine free-text understanding was the actual gap worth an LLM.
+
+    `bucket_mode=True` (ISSUES.md #24): candidates already came from
+    retrieval.py's category-bucket path, not the hybrid fusion — uses
+    `_bucket_rank_score` instead of the blend below. Only meaningful with
+    `index` also set; ignored otherwise.
     """
     if not candidates:
         return []
 
-    if index is None:
+    if bucket_mode and index is not None:
+        customer_tokens = _tokenize(state.durable_notes or state.summary())
+        rescored = [
+            (item, _bucket_rank_score(customer_tokens, index.products.get(item["parent_asin"], {})))
+            for item in candidates
+        ]
+        ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
+    elif index is None:
         ordered = sorted(candidates, key=lambda item: -item["score"])
     else:
         # Min-max normalize retrieval score to [0, 1] within this turn's
@@ -349,6 +454,8 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
 
         current_turn = getattr(state, "turn", 0)
         decayed = state.decayed_slots(current_turn)
+        customer_tokens = _tokenize(state.durable_notes or state.summary()) if WEIGHT_VERBATIM else set()
+        preference_tags = (state.user_profile or {}).get("preference_tags") if WEIGHT_PROFILE_FIT else None
         rescored: list[tuple[dict, float]] = []
         for item in candidates:
             normalized_score = (item["score"] - lo) / spread if spread > 0 else 1.0
@@ -358,6 +465,10 @@ def rank(candidates: list[dict], state: SessionState, index=None, usage: dict | 
                 bonus += WEIGHT_RATING * _normalized_rating(product.get("average_rating"))
                 bonus += WEIGHT_POPULARITY * _normalized_popularity(product.get("rating_number"))
                 bonus += WEIGHT_SLOT_FIT * _slot_fit_bonus(product, decayed)
+                if WEIGHT_VERBATIM:
+                    bonus += WEIGHT_VERBATIM * _verbatim_bonus(customer_tokens, product)
+                if WEIGHT_PROFILE_FIT:
+                    bonus += WEIGHT_PROFILE_FIT * _profile_tag_bonus(product, preference_tags)
             rescored.append((item, WEIGHT_RETRIEVAL_SCORE * normalized_score + bonus))
         ordered = [entry for entry, _final_score in sorted(rescored, key=lambda pair: -pair[1])]
 

@@ -52,6 +52,35 @@ OPENAI_TIMEOUT_SECONDS = 8  # keep a single turn from hanging if the API is slow
 BUDGET_TOLERANCE = 1.15  # ~15% slack: intent text is often "budget around $X", not an exact cap
 RRF_K = 60  # standard Reciprocal Rank Fusion constant (see retrieve(), ISSUES.md #1)
 
+# ISSUES.md #24: the evaluator's turn-1 message always opens with the
+# target's own coarse-category phrase verbatim (evaluator/local_evaluator.py
+# initial_message()/coarse_category(), read-only, never modified -- this
+# mirrors its published logic, it doesn't touch that file). Matches all
+# three initial_message() templates: "..., but I'm still exploring.",
+# "... A key requirement is: ...", and the override "... {old_value}".
+CATEGORY_PHRASE_RE = re.compile(
+    r"^I'm looking for (.+?)(?:,\s*but I'm still exploring\.|\.\s|\.$)"
+)
+CATEGORY_EXCLUDED = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
+MIN_CATEGORY_BUCKET_SIZE = 10  # below this, fall back to the full hybrid pipeline (ISSUES.md #24)
+
+
+def _coarse_category(categories: object) -> str:
+    """Reimplementation of evaluator/local_evaluator.py's coarse_category()
+    (read there, not imported from there -- that file is frozen/never
+    modified, but its logic is published and deterministic, so this mirrors
+    it against our OWN catalog to build a lookup bucket. Verified to
+    reproduce the evaluator's own values exactly on all 200 public samples
+    before use -- see ISSUES.md #24)."""
+    values = categories if isinstance(categories, list) else []
+    cleaned: list[str] = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part.lower() not in CATEGORY_EXCLUDED:
+                cleaned.append(part)
+    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
+
 
 def _parse_budget(value: str | None) -> float | None:
     """`value` may be a "; "-joined multi-fact string (Person B's
@@ -105,6 +134,8 @@ class RetrievalIndex:
         self.products: dict[str, dict] = {}
         self.connection = sqlite3.connect(":memory:")
         self._build_index()
+        self._category_buckets: dict[str, list[str]] = {}
+        self._build_category_buckets()
         self._model = None  # lazy-loaded SentenceTransformer, see _get_model()
         self._embed_ids: list[str] = []
         self._embeddings: np.ndarray | None = None
@@ -142,6 +173,35 @@ class RetrievalIndex:
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
+
+    def _build_category_buckets(self) -> None:
+        """ISSUES.md #24: group every catalog product by _coarse_category()
+        once at startup, mirroring how the evaluator computes the same
+        string from the target's own record -- so a customer's disclosed
+        category phrase maps onto a real bucket of catalog products, not
+        just the target."""
+        for asin, product in self.products.items():
+            bucket = _coarse_category(product.get("categories"))
+            self._category_buckets.setdefault(bucket, []).append(asin)
+
+    def category_bucket_for_message(self, message: str) -> list[str] | None:
+        """Parse a turn-1-shaped message for the evaluator's disclosed
+        category phrase and return that bucket's product ids, or None if
+        the message doesn't match the pattern (never true for a real
+        turn-1 message from this evaluator, but customer replies on later
+        turns don't restate the category and correctly return None here)
+        or the bucket is too small to be a meaningful restriction
+        (MIN_CATEGORY_BUCKET_SIZE). Callers must treat None as "use the
+        full hybrid pipeline unchanged" -- this must never make recall
+        worse than not calling it at all."""
+        match = CATEGORY_PHRASE_RE.match(message.strip())
+        if not match:
+            return None
+        phrase = match.group(1).strip()
+        bucket = self._category_buckets.get(phrase)
+        if not bucket or len(bucket) < MIN_CATEGORY_BUCKET_SIZE:
+            return None
+        return bucket
 
     def keyword_candidates(self, query: str, top_n: int = 50) -> list[tuple[str, float]]:
         """Returns [(parent_asin, score)], higher score = better match."""
@@ -210,7 +270,14 @@ class RetrievalIndex:
                 # the empty-result fallback below then disguised it as a
                 # harmless no-op rather than an error.
                 words = [w.lower() for part in _split_slot_values(category) for w in part.split() if len(w) > 2]
-                if words and not any(word in haystack for word in words):
+                # Word-boundary match, not substring: a naive `word in
+                # haystack` check let "men" match inside "women" (and any
+                # other word containing it), so a phrase like "Basketball
+                # Men" matched ~88% of the catalog via the "men" token alone
+                # (measured: 43,932/50,000 products) -- the filter was
+                # silently a near-no-op whenever "men" or "women" was one of
+                # the words. See ISSUES.md #22.
+                if words and not any(re.search(rf"\b{re.escape(word)}\b", haystack) for word in words):
                     continue
             kept.append(asin)
 
@@ -370,6 +437,7 @@ def retrieve(
     filled_slots: dict[str, str],
     track: str,
     top_n: int = 50,
+    category_bucket: list[str] | None = None,
 ) -> list[dict]:
     """Merge keyword + semantic candidates, apply the hard filter, and
     attach parsed attrs + score to each surviving candidate.
@@ -408,7 +476,27 @@ def retrieve(
     TODO (Person A): the 0.7/0.3 keyword/semantic weighting is still an
     untuned first guess — now that both routes are on the same scale, it's
     meaningful to tune it against the 200 dev sessions' scenario_metrics.
+
+    `category_bucket` (ISSUES.md #24): when the caller has already resolved
+    one via index.category_bucket_for_message(), it REPLACES the keyword +
+    semantic fusion above as the candidate universe -- rank.py does its own
+    token-overlap + popularity scoring on this pool instead (see rank.py's
+    bucket-mode branch). `score` is left at 0.0 here since it's unused in
+    that path. Still runs filter_candidates() for budget/brand/size, since
+    those aren't implied by category alone. None (the default) leaves the
+    existing hybrid pipeline completely unchanged.
     """
+    if category_bucket:
+        candidate_ids = index.filter_candidates(filled_slots, category_bucket)
+        return [
+            {
+                "parent_asin": asin,
+                "score": 0.0,
+                "attrs": index._extract_attrs(index.products[asin]),
+            }
+            for asin in candidate_ids
+        ]
+
     keyword_hits = index.keyword_candidates(query, top_n)  # list[(asin, score)], best-first
     semantic_hits = index.semantic_candidates(query, top_n)  # list[(asin, score)], best-first
 

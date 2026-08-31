@@ -47,6 +47,13 @@ class SessionState:
         self.turn_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         self.other_asked_count: int = 0  # see record_ask()
         self.shown_asins: set[str] = set()  # see record_shown() / clear_shown()
+        # Resolved once from the turn-1 message (see retrieval.py's
+        # category_bucket_for_message / ISSUES.md #24), then kept for the
+        # rest of the session -- including through an intent override, since
+        # the category itself doesn't change when other preferences do.
+        # None until resolved or if resolution fails/is too small; the
+        # retrieval fallback path is unaffected either way.
+        self.category_bucket: list[str] | None = None
 
     def advance_turn(self, turn: int) -> None:
         """Call once at the start of each `respond()` call, before anything

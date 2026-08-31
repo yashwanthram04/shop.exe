@@ -17,3 +17,10 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+# Local-only demo prep drafts — not part of the submission.
+demo/demo_script_3min.md
+demo/demo_script_flowing.md
+demo/architecture.drawio
+demo/canva_edit_brief.md
+demo/canva_prompt_standalone.md
+demo/devpost_writeup.md

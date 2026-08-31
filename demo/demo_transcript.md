@@ -34,14 +34,9 @@ Turn 3
 Turn 4
   Customer : I don't have an additional preference for brand.
   Agent    : 'Do you have a color preference?'  (ask_attribute='color')
-  Top-10   : miss
+  Top-10   : HIT, rank 3
 
-Turn 5
-  Customer : I don't have an additional preference for color.
-  Agent    : 'Do you have a style preference?'  (ask_attribute='style')
-  Top-10   : HIT, rank 2
-
-RESULT: HIT at turn 5, rank 2
+RESULT: HIT at turn 4, rank 3
 
 =================================================================================
 [BOUNDARY — customer has no preference]  sample_id=public_0180  target=B01HSMYV8E
@@ -70,9 +65,19 @@ Turn 4
 Turn 5
   Customer : I don't have an additional preference for color.
   Agent    : 'Do you have a style preference?'  (ask_attribute='style')
-  Top-10   : HIT, rank 2
+  Top-10   : miss
 
-RESULT: HIT at turn 5, rank 2
+Turn 6
+  Customer : I don't have an additional preference for style.
+  Agent    : 'Is there anything else that matters to you?'  (ask_attribute='other')
+  Top-10   : miss
+
+Turn 7
+  Customer : For that, what matters is: 100% Mesh; Imported.
+  Agent    : "Here are some options based on what you've told me so far."  (ask_attribute=None)
+  Top-10   : HIT, rank 8
+
+RESULT: HIT at turn 7, rank 8
 
 =========================================================================================
 [INTENT OVERRIDE — customer changes their mind]  sample_id=public_0068  target=B08SH8GF6K
@@ -111,14 +116,14 @@ Turn 6
 Turn 7
   Customer : For that, what matters is: Dual-density outsole with Hyper Pillar comfort technology; Lightweight and responsive Ultra Go midsole cushioning.
   Agent    : 'Is there anything else that matters to you?'  (ask_attribute='other')
-  Top-10   : HIT, rank 2
+  Top-10   : HIT, rank 1
 
-RESULT: HIT at turn 7, rank 2
+RESULT: HIT at turn 7, rank 1
 
 ============================================================
 SUMMARY
 ============================================================
   buying           public_0005    turn 1, rank 1
-  browsing         public_0087    turn 5, rank 2
-  boundary         public_0180    turn 5, rank 2
-  intent_override  public_0068    turn 7, rank 2
+  browsing         public_0087    turn 4, rank 3
+  boundary         public_0180    turn 7, rank 8
+  intent_override  public_0068    turn 7, rank 1
