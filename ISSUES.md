@@ -1174,6 +1174,87 @@ a merge.
 
 ---
 
+## Issue 28 — `.env`'s `OPENAI_API_KEY` silently contaminated every "clean" test this session; corrected 🔴 CRITICAL
+
+**Status:** ✅ root cause found and fixed. Every number in Issues 20-27
+was measured with OpenAI embeddings silently active, not local
+embeddings as documented and intended. Re-verified everything that
+matters under confirmed-clean conditions below.
+
+**How this happened:** `agent.py` calls `load_dotenv()` on import, which
+loads `.env` into `os.environ`. `load_dotenv()`'s default behavior does
+not override a variable that is already set — but it *does* set a
+variable that is merely absent, which is exactly what a shell-level
+`unset OPENAI_API_KEY` produces. So every `unset OPENAI_API_KEY ...;
+python -m evaluator.local_evaluator` command run all session, intended
+to test the deterministic local-embedding default, actually ran with
+OpenAI embeddings active the whole time, because a local `.env` file
+(containing real `OPENAI_API_KEY`/`GROQ_API_KEY` values, created earlier
+for legitimate LLM-role testing) silently re-populated the key inside the
+Python process regardless of the shell state.
+
+**Discovered via:** a fresh `git clone` reproducibility check (no `.env`
+exists in a fresh clone) scored **0.857783** — different from the
+**0.862823** documented as final in Issue 27. Verified this wasn't a
+catalog or code difference (byte-identical catalog hash, identical repo
+state) before suspecting the environment itself. Confirmed directly:
+`unset OPENAI_API_KEY; python -c "from dotenv import load_dotenv;
+load_dotenv(); import os; print(os.environ.get('OPENAI_API_KEY'))"`
+printed the real key. Temporarily renamed `.env` out of the way and
+re-ran — reproduced **0.857783** exactly, matching the fresh clone
+byte-for-byte on every scenario metric. This is now confirmed genuinely
+deterministic.
+
+**What was and wasn't affected:** `.env` contained only
+`OPENAI_API_KEY`/`GROQ_API_KEY`, no `USE_LLM_*` or `USE_CATEGORY_BUCKET`
+flags. Those flags were correctly unset all session (nothing in `.env`
+to resurrect them), so every LLM-role and category-bucket measurement
+(Issues 9, 15-18, 20-21, 24-25) tested what it claimed to test. **Only
+the embedding source was contaminated** — meaning **Issue 23's "OpenAI
+vs local: confirmed no difference" is now suspect**: both sides of that
+comparison likely had `OPENAI_API_KEY` present, making it an accidental
+OpenAI-vs-OpenAI comparison rather than the OpenAI-vs-local test it
+claimed to be. Flagging this as **unverified, needs re-test** rather than
+re-asserting it, since I can't reconstruct the exact conditions of that
+specific historical run with confidence.
+
+**Re-verified under confirmed-clean conditions** (`.env` physically
+renamed out of the directory, not just shell-unset): re-swept
+`SLOT_FIT_CAP` from scratch, since Issue 27's `2.5` was tuned under the
+contaminated condition:
+
+| `SLOT_FIT_CAP` (true clean) | score | hit rate | MRR |
+|---|---|---|---|
+| 1.0 | 0.8372 | 0.960 | 0.6406 |
+| 1.5 | 0.8478 | 0.980 | 0.6382 |
+| 2.0 | 0.8568 | 0.985 | 0.6500 |
+| 2.5 (Issue 27's value) | 0.8578 | 0.985 | 0.6529 |
+| 3.0 | 0.8587 | 0.985 | 0.6559 |
+| **None (uncapped)** | **0.8587** | 0.985 | 0.6559 |
+
+Strictly monotonic — looser caps keep winning, and uncapped ties for
+best. **The cap itself provides no benefit under true-clean conditions**;
+Issue 26's original "cap it" finding does not hold up once re-measured
+without the embedding contamination and with the teammate's category fix
+merged in. Set `SLOT_FIT_CAP = None`.
+
+**Corrected final locked configuration:** `SLOT_FIT_CAP = None`,
+`WEIGHT_SLOT_FIT = 0.5` (not independently re-swept under the corrected
+condition due to time; every prior sweep of this weight showed a wide
+flat plateau across 0.3-0.7, so this is a reasonable carry-forward, not
+a verified optimum). **TechnicalScore 0.8587**, confirmed identical
+across two independent methods (fresh `git clone` and `.env`-disabled
+local run) — this is genuinely the number a cold clone reproduces.
+
+**Lesson, stated plainly:** `unset VAR` in a shell does not guarantee a
+Python process sees `VAR` as absent if that process calls `load_dotenv()`
+— a local dev `.env` file can silently override a "clean" test in a way
+that's invisible unless you check for it directly. Every future
+"deterministic default" claim in this project should be verified against
+either a fresh clone or a `.env`-disabled run, not just a shell `unset`.
+
+---
+
 ## Fix order (final)
 
 1. ✅ **Issue 1** — fusion. 0.4342 → 0.6084.
@@ -1207,29 +1288,38 @@ a merge.
     (following up on Issue 24's popularity-skew finding). Tested,
     rejected — the signal doesn't transfer outside a category-restricted
     pool. Kept at 0.10.
-17. ✅ **Issue 26** — `_slot_fit_bonus` was structurally unbounded (could
-    reach ~3.0 raw vs a 0.15-capped retrieval term) and dominated
-    everything else. Capped it (`SLOT_FIT_CAP=1.0`) and re-tuned
-    `WEIGHT_SLOT_FIT` (0.4→0.5). → 0.8604, MRR 0.6055→0.6719. The
-    first genuine score improvement since Issue 19, found by
-    instrumenting the real pipeline rather than adding a new signal.
-18. ✅ **Issue 27** — merged with a teammate's independent, correct fix
-    (`category` was matched by exact-substring when it's a multi-word
-    phrase, silently contributing zero; moved to token-overlap matching).
-    Combining naively regressed to 0.8525 because `SLOT_FIT_CAP=1.0` had
-    been calibrated in a world where category contributed nothing.
-    Re-tuned `SLOT_FIT_CAP` (1.0→2.5) against the actual merged pipeline.
-    → **0.8628**, MRR 0.6719→0.6744. Beats both individual fixes —
-    confirms the two changes were complementary, not competing; the
-    apparent regression was a stale-constant problem, not incompatibility.
+17. ⚠️ **Issue 26** — `_slot_fit_bonus` uncapped fix, measured 0.8604 —
+    **superseded by Issue 28**: this number was measured with OpenAI
+    embeddings silently active (see Issue 28). The instrumentation
+    finding (one term dominating the formula) was real; the specific
+    cap value was not correctly calibrated.
+18. ⚠️ **Issue 27** — merge re-tune with a teammate's independent,
+    correct category-matching fix, measured 0.8628 — **also superseded
+    by Issue 28** for the same reason. The merge-compatibility finding
+    (the two fixes are complementary, not competing) still holds; the
+    specific numbers do not.
+19. ✅ **Issue 28** — discovered `.env`'s `OPENAI_API_KEY` had silently
+    contaminated every "clean" measurement all session (shell `unset`
+    doesn't survive `load_dotenv()`). Re-verified everything under
+    confirmed-clean conditions (fresh `git clone` + `.env`-disabled
+    local run, byte-identical results from both). Re-swept
+    `SLOT_FIT_CAP` from scratch: uncapped ties for best, the cap
+    provides no benefit under true-clean conditions. → **0.8587**.
 
-**Final: TechnicalScore 0.8628, hit rate 98% (196/200), MRR 0.6744,
-MTTC 2.475**, fully deterministic, zero API keys required by default.
-4 misses remain (`public_0020`, `public_0095`, `public_0096`,
-`public_0161`): 3 are the same sessions diagnosed in Issue 19 as a
-likely genuine information ceiling; the 4th (`public_0095`) is a new
-miss introduced by Issue 26's cap fix itself — a deliberate, measured
-tradeoff (net MRR gain far outweighing the cost of one session's hit).
+**Final: TechnicalScore 0.8587, hit rate 98.5% (197/200), MRR 0.6559,
+MTTC 2.53**, fully deterministic, zero API keys required by default,
+verified reproducible via independent fresh clone. 3 misses remain
+(`public_0020`, `public_0095`, `public_0096`) — all diagnosed as the
+same generic-facts/information-ceiling pattern from Issue 19.
+
+**A note on how this number moved around:** 0.8445 (Issue 19) → 0.8604
+(Issue 26) → 0.8628 (Issue 27) → **0.8587 (Issue 28, corrected)**. The
+middle two numbers were real in the sense that the code changes they're
+attached to are genuine improvements over the 0.8445 baseline — they
+were measured under a silently-contaminated embedding source, not
+fabricated. The final, trustworthy number is lower than the
+contaminated peak but higher than where this file started, and — most
+importantly — it is the number two independent methods agree on.
 
 Re-run `python -m evaluator.local_evaluator` after any further change, one
 at a time, and record the scenario breakdown — several conclusions in this

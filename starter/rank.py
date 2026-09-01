@@ -54,8 +54,8 @@ import re
 from .state import SessionState
 
 WEIGHT_RETRIEVAL_SCORE = 0.15  # see ISSUES.md #14/#19 for the sweeps that picked this value
-WEIGHT_SLOT_FIT = 0.5  # see ISSUES.md #26/#27 -- 0.3-0.6 tie at cap=2.5, 0.5 kept mid-plateau
-SLOT_FIT_CAP = 2.5  # see ISSUES.md #27 -- re-tuned after merging with the category-matching fix (Issue 22's neighbor); 1.0 was calibrated before category contributed to the sum
+WEIGHT_SLOT_FIT = 0.5  # see ISSUES.md #26/#27/#28
+SLOT_FIT_CAP = None  # see ISSUES.md #28 -- uncapped ties for best under verified-clean conditions; capping was net-negative once measured without OpenAI-embedding contamination
 WEIGHT_RATING = 0.15
 WEIGHT_POPULARITY = 0.10
 WEIGHT_VERBATIM = 0.0  # see ISSUES.md #20 for the sweep that picks this value -- tested, rejected, kept off
