@@ -48,7 +48,7 @@ The four pipeline areas (routing/state, retrieval, clarification/ranking, and or
    ```
    pip install -r requirements.txt
    ```
-2. Download the product catalog (gitignored, required at `data/catalog.jsonl`):
+2. Get `catalog.jsonl.gz` (the 50,000-product catalog) from the challenge's participant kit — check the original challenge announcement/repository for the exact download link, since it isn't hosted in this repo. Once you have the file, extract it to the required path:
    ```
    gzip -dk catalog.jsonl.gz
    mv catalog.jsonl data/catalog.jsonl
@@ -59,8 +59,7 @@ The four pipeline areas (routing/state, retrieval, clarification/ranking, and or
    cp .env.example .env
    ```
    Every flag in `.env` (`OPENAI_API_KEY`, `GROQ_API_KEY`, `USE_LLM_EXTRACTION`, `USE_LLM_QUERY_SYNTHESIS`, `USE_LLM_RERANK`, `USE_CATEGORY_BUCKET`) is optional and off by default. With none of them set, the agent runs fully offline and deterministically — this is the configuration the results below were measured on.
-
-**Note on the embedding model:** the first time the agent runs, `sentence-transformers` downloads the local `all-MiniLM-L6-v2` model from Hugging Face automatically — this needs internet access, one time only. That first run also embeds all 50,000 catalog products and caches the vectors to `data/.embedding_cache/` (gitignored), which is the slow, CPU-bound step. Every run after that reads from the cache and is fast and fully offline, with no internet or API calls required — "runs offline" describes steady-state behavior, not the very first invocation.
+4. **First run only:** the agent needs internet access once to download the local embedding model (`sentence-transformers`' `all-MiniLM-L6-v2`, from Hugging Face) and to embed all 50,000 catalog products, caching the vectors to `data/.embedding_cache/` (gitignored). This is the slow, CPU-bound step — expect the first `python -m evaluator.local_evaluator` run to take noticeably longer than later ones. Every run after that reads from the cache and needs no internet access or API calls at all.
 
 ## Steps to Reproduce Results
 
