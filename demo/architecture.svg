@@ -128,9 +128,9 @@
        (not the side, and offset from the "read notes" state connector at
        x=570) so the horizontal run at y=190 sits in the clear gap below
        all six boxes (which end at y=150) and above the state bar (which
-       starts at y=230) -- routed past box 6's right edge (x=1320) before
+       starts at y=230), routed past box 6's right edge (x=1320) before
        dropping down, so it clears every box and the state bar. Originally
-       ran through the vertical center of boxes 4-6 (y=110) -- fixed. -->
+       ran through the vertical center of boxes 4-6 (y=110); fixed. -->
   <path d="M 610 150 L 610 190 L 1340 190 L 1340 330 L 924 330" fill="none" stroke="#1a6b63" stroke-width="1.3" marker-end="url(#arrow)"/>
 
   <!-- ============ Legend ============ -->
