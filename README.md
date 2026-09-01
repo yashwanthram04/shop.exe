@@ -48,12 +48,12 @@ The four pipeline areas (routing/state, retrieval, clarification/ranking, and or
    ```
    pip install -r requirements.txt
    ```
-2. Get `catalog.jsonl.gz` (the 50,000-product catalog) from the challenge's participant kit — check the original challenge announcement/repository for the exact download link, since it isn't hosted in this repo. Once you have the file, extract it to the required path:
+2. Extract the 50,000-product catalog (`catalog.jsonl.gz`, included in this repo) to the required path:
    ```
    gzip -dk catalog.jsonl.gz
    mv catalog.jsonl data/catalog.jsonl
    ```
-   Verify the download against the checksums in `SHA256SUMS`.
+   Verify it against the checksum in `SHA256SUMS` if you want to confirm it matches the original participant-kit file byte-for-byte.
 3. (Optional) Copy the environment template if you want to try the opt-in LLM features:
    ```
    cp .env.example .env
